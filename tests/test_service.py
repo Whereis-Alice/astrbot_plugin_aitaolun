@@ -1,0 +1,435 @@
+"""End-to-end guard behaviour with a fake HTTP client - no network at all.
+
+These are the tests that matter most: every case here is something the platform
+punishes (wasted captcha, duplicate content, writing while rate-limited or
+banned, unattributed images), and the point is that it never leaves this
+process.
+"""
+
+import asyncio
+import time
+
+from aitaolun.errors import (
+    AitaolunApiError,
+    AitaolunConfigError,
+    AitaolunGuardError,
+)
+from aitaolun.docs import DocPage, revision_of
+from aitaolun.gate import PostingGate
+from aitaolun.guard import fingerprint
+from aitaolun.service import CaptchaPending, AitaolunService
+from aitaolun.state import StateStore
+
+IMG = "/img/" + "a" * 24 + ".webp"
+TID = "b" * 24
+
+
+def run(coro):
+    return asyncio.run(coro)
+
+
+class FakeDocs:
+    def __init__(self):
+        self.fetches = 0
+
+    async def fetch(self, name, force=True):
+        self.fetches += 1
+        text = "闸门：说人话，带刺，不要助手腔。"
+        return DocPage(
+            name=name,
+            url="https://aitaolun.net/%s.md" % name,
+            text=text,
+            fetched_at=time.time(),
+            revision=revision_of(text),
+        )
+
+
+class FakeClient:
+    """Records every call and replays scripted results or errors."""
+
+    def __init__(self, **results):
+        self.calls = []
+        self.results = results
+        self.captcha_question = "12 + 5 = ?"
+        self.captcha_id = "cap1"
+
+    def _record(self, name, args):
+        self.calls.append((name, args))
+        outcome = self.results.get(name)
+        if callable(outcome):
+            return outcome(self, args)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome if outcome is not None else {"id": "c" * 24}
+
+    async def stats(self):
+        return self._record("stats", {})
+
+    async def captcha(self, purpose):
+        self.calls.append(("captcha", {"purpose": purpose}))
+        error = self.results.get("captcha")
+        if isinstance(error, Exception):
+            raise error
+        return {"captcha_id": self.captcha_id, "question": self.captcha_question}
+
+    async def create_thread(self, slug, title, body, captcha_id=None, answer=None):
+        return self._record(
+            "create_thread",
+            {
+                "slug": slug,
+                "title": title,
+                "body": body,
+                "captcha_id": captcha_id,
+                "answer": answer,
+            },
+        )
+
+    async def create_floor(self, thread_id, body, captcha_id=None, answer=None):
+        return self._record(
+            "create_floor",
+            {"thread_id": thread_id, "body": body, "captcha_id": captcha_id, "answer": answer},
+        )
+
+    async def create_subfloor(
+        self, floor_id, body, reply_to=None, captcha_id=None, answer=None
+    ):
+        return self._record(
+            "create_subfloor",
+            {"floor_id": floor_id, "body": body, "reply_to": reply_to},
+        )
+
+    async def vote(self, target_type, target_id, value):
+        return self._record(
+            "vote", {"target_type": target_type, "target_id": target_id, "value": value}
+        )
+
+    async def ingest_image(self, source_url, captcha_id=None, answer=None):
+        return self._record("ingest_image", {"source_url": source_url})
+
+    async def send_message(self, to, body, captcha_id=None, answer=None):
+        return self._record("send_message", {"to": to, "body": body})
+
+    def count(self, name):
+        return sum(1 for item in self.calls if item[0] == name)
+
+
+def build(client, *, enforce=True, with_key=True, tmp_path=None):
+    store = StateStore(data_dir=tmp_path)
+    if with_key:
+        store.set_api_key("atl_" + "k" * 40, "测试机")
+    docs = FakeDocs()
+    gate = PostingGate(docs=docs, enforce=enforce)
+    service = AitaolunService(client=client, store=store, gate=gate, docs=docs)
+    return service, store, gate
+
+
+def fresh_token(gate):
+    token, _ = run(gate.open("test"))
+    return token.token
+
+
+def expect_guard(callable_, *, contains=""):
+    try:
+        run(callable_())
+    except AitaolunGuardError as error:
+        if contains:
+            assert contains in str(error), str(error)
+        return str(error)
+    raise AssertionError("expected a local guard refusal")
+
+
+# ------------------------------------------------------------------ pre-flight
+
+
+def test_reads_work_without_a_credential(tmp_path):
+    client = FakeClient(stats={"agents": 3, "threads": 4})
+    service, _, _ = build(client, with_key=False, tmp_path=tmp_path)
+    text = run(service.stats())
+    assert text
+    assert client.count("stats") == 1
+
+
+def test_writes_without_a_credential_fail_fast(tmp_path):
+    client = FakeClient()
+    service, _, gate = build(client, with_key=False, tmp_path=tmp_path)
+    try:
+        run(service.create_thread("shuiba", "标题", "正文", fresh_token(gate)))
+    except AitaolunConfigError as error:
+        assert "api_key" in str(error)
+    else:
+        raise AssertionError("a missing api_key must stop the write")
+    assert client.calls == []
+
+
+# --------------------------------------------------------------- content guard
+
+
+def test_oversized_body_never_reaches_the_network_or_burns_the_gate(tmp_path):
+    client = FakeClient()
+    service, _, gate = build(client, tmp_path=tmp_path)
+    token = fresh_token(gate)
+
+    expect_guard(
+        lambda: service.create_thread("shuiba", "标题", "x" * 20001, token),
+        contains="本地校验未通过",
+    )
+    assert client.calls == []
+    # The token is still unused, so the model does not have to re-read the gate.
+    assert [item.token for item in gate.active_tokens()] == [token]
+
+
+def test_subfloor_rules_are_enforced_locally(tmp_path):
+    client = FakeClient()
+    service, _, gate = build(client, tmp_path=tmp_path)
+
+    expect_guard(
+        lambda: service.reply("subfloor", TID, "x" * 141, gate_token=fresh_token(gate))
+    )
+    expect_guard(
+        lambda: service.reply(
+            "subfloor", TID, "看图 ![x](%s)" % IMG, gate_token=fresh_token(gate)
+        )
+    )
+    expect_guard(lambda: service.reply("floor", "not-an-id", "正文"))
+    assert client.calls == []
+
+
+def test_unattributed_in_site_image_is_refused(tmp_path):
+    client = FakeClient()
+    service, store, gate = build(client, tmp_path=tmp_path)
+    body = "配图 ![x](%s)" % IMG
+
+    expect_guard(lambda: service.create_thread("shuiba", "标题", body, fresh_token(gate)))
+    assert client.calls == []
+
+    store.record_image(IMG, "https://example.com/a.png")
+    run(service.create_thread("shuiba", "标题", body, fresh_token(gate)))
+    assert client.count("create_thread") == 1
+
+
+def test_private_messages_cannot_carry_images(tmp_path):
+    client = FakeClient()
+    service, store, gate = build(client, tmp_path=tmp_path)
+    store.record_image(IMG, "own")
+    expect_guard(
+        lambda: service.messages(action="send", to="someone", body="![x](%s)" % IMG)
+    )
+    assert client.calls == []
+
+
+# ------------------------------------------------------------------ gate
+
+
+def test_public_write_without_a_gate_token_is_refused(tmp_path):
+    client = FakeClient()
+    service, _, _ = build(client, tmp_path=tmp_path)
+    expect_guard(
+        lambda: service.create_thread("shuiba", "标题", "正文"),
+        contains="posting-gate.md",
+    )
+    assert client.calls == []
+
+
+def test_gate_token_is_burned_by_one_successful_write(tmp_path):
+    client = FakeClient()
+    service, _, gate = build(client, tmp_path=tmp_path)
+    token = fresh_token(gate)
+    run(service.create_thread("shuiba", "标题", "第一帖", token))
+    assert gate.active_tokens() == []
+    expect_guard(lambda: service.create_thread("shuiba", "标题", "第二帖", token))
+    assert client.count("create_thread") == 1
+
+
+def test_gate_can_be_disabled_for_local_testing(tmp_path):
+    client = FakeClient()
+    service, _, _ = build(client, enforce=False, tmp_path=tmp_path)
+    text = run(service.create_thread("shuiba", "标题", "正文"))
+    assert "闸门强制已关闭" in text
+
+
+# -------------------------------------------------------------- duplicates
+
+
+def test_same_content_aimed_at_a_new_target_is_refused_locally(tmp_path):
+    client = FakeClient()
+    service, store, gate = build(client, tmp_path=tmp_path)
+    store.record_write("thread", "abar", fingerprint("标题", "同一段话"), "id1")
+
+    expect_guard(
+        lambda: service.create_thread("bbar", "标题", "同一段话", fresh_token(gate)),
+        contains="DUPLICATE_CONTENT",
+    )
+    assert client.calls == []
+
+
+def test_exact_retry_on_the_same_target_is_allowed(tmp_path):
+    client = FakeClient(create_thread={"id": "d" * 24, "already_exists": True})
+    service, store, gate = build(client, tmp_path=tmp_path)
+    store.record_write("thread", "abar", fingerprint("标题", "同一段话"), "id1")
+
+    text = run(service.create_thread("abar", "标题", "同一段话", fresh_token(gate)))
+    assert client.count("create_thread") == 1
+    assert "already_exists" in text or "已存在" in text
+
+
+# ----------------------------------------------------------------- captcha
+
+
+def test_428_is_solved_locally_and_retried_byte_identically(tmp_path):
+    def create_thread(client, args):
+        if not args["captcha_id"]:
+            raise AitaolunApiError(428, "CAPTCHA_REQUIRED", "captcha required")
+        assert args["answer"] == "17"
+        return {"thread_id": "e" * 24}
+
+    client = FakeClient(create_thread=create_thread)
+    service, _, gate = build(client, tmp_path=tmp_path)
+    body = "带刺的正文\n第二行"
+    run(service.create_thread("shuiba", "标题", body, fresh_token(gate)))
+
+    attempts = [args for name, args in client.calls if name == "create_thread"]
+    assert len(attempts) == 2
+    # Same target, same bytes; only the captcha fields changed.
+    assert attempts[0]["body"] == attempts[1]["body"] == body
+    assert attempts[0]["slug"] == attempts[1]["slug"]
+    assert attempts[1]["captcha_id"] == "cap1"
+    assert client.count("captcha") == 1
+
+
+def test_unsolvable_captcha_is_handed_back_to_the_model(tmp_path):
+    client = FakeClient(
+        create_thread=AitaolunApiError(428, "CAPTCHA_REQUIRED", "captcha required")
+    )
+    client.captcha_question = "下面哪个词是名词：苹果、跑、快"
+    service, _, gate = build(client, tmp_path=tmp_path)
+
+    try:
+        run(service.create_thread("shuiba", "标题", "正文", fresh_token(gate)))
+    except CaptchaPending as error:
+        text = str(error)
+        assert "cap1" in text
+        assert client.captcha_question in text
+        assert "一个字都不要改" in text
+    else:
+        raise AssertionError("an unsolvable captcha must come back to the model")
+
+
+def test_a_wrong_supplied_answer_does_not_loop(tmp_path):
+    client = FakeClient(
+        create_thread=AitaolunApiError(400, "CAPTCHA_INVALID", "wrong answer")
+    )
+    service, _, gate = build(client, tmp_path=tmp_path)
+    expect_guard(
+        lambda: service.create_thread(
+            "shuiba", "标题", "正文", fresh_token(gate), captcha_id="cap1", captcha_answer=99
+        ),
+        contains="拿一道新题",
+    )
+    # Exactly one attempt: no silent retry storm.
+    assert client.count("create_thread") == 1
+
+
+# --------------------------------------------------------------- rate limits
+
+
+def test_public_rate_limit_becomes_a_local_cooldown(tmp_path):
+    client = FakeClient(
+        create_thread=AitaolunApiError(
+            429, "PUBLIC_RATE_LIMITED", "too fast", retry_after=90
+        )
+    )
+    service, store, gate = build(client, tmp_path=tmp_path)
+
+    try:
+        run(service.create_thread("shuiba", "标题", "正文", fresh_token(gate)))
+    except AitaolunApiError as error:
+        assert error.code == "PUBLIC_RATE_LIMITED"
+    else:
+        raise AssertionError("the server error must surface")
+
+    cooldown = store.cooldown("public_write")
+    assert cooldown is not None and 80 <= cooldown.remaining <= 90
+
+    expect_guard(
+        lambda: service.create_thread("shuiba", "别的标题", "别的正文", fresh_token(gate)),
+        contains="本地冷却",
+    )
+    assert client.count("create_thread") == 1
+    # Reading is still allowed while writes are cooling down.
+    run(service.stats())
+
+
+def test_message_and_image_cooldowns_are_tracked_separately(tmp_path):
+    client = FakeClient(
+        send_message=AitaolunApiError(429, "RATE_LIMITED", "slow"),
+    )
+    service, store, gate = build(client, tmp_path=tmp_path)
+    try:
+        run(service.messages(action="send", to="someone", body="你好"))
+    except AitaolunApiError:
+        pass
+    assert store.cooldown("message") is not None
+    # A public write is unaffected by a private-message cooldown.
+    run(service.create_thread("shuiba", "标题", "正文", fresh_token(gate)))
+
+
+# ---------------------------------------------------------------- ban latch
+
+
+def test_platform_ban_latches_and_stops_everything_authenticated(tmp_path):
+    client = FakeClient(
+        create_thread=AitaolunApiError(403, "BANNED_PLATFORM", "永久封禁")
+    )
+    service, store, gate = build(client, tmp_path=tmp_path)
+
+    try:
+        run(service.create_thread("shuiba", "标题", "正文", fresh_token(gate)))
+    except AitaolunApiError as error:
+        assert error.is_fatal
+    else:
+        raise AssertionError("the ban must surface")
+
+    assert store.platform_ban() is not None
+    before = len(client.calls)
+    expect_guard(
+        lambda: service.create_thread("shuiba", "别的", "别的正文", fresh_token(gate)),
+        contains="本地硬停",
+    )
+    expect_guard(lambda: service.vote("thread", TID, 1))
+    expect_guard(lambda: service.messages(action="inbox"))
+    assert len(client.calls) == before
+
+
+# --------------------------------------------------------------------- misc
+
+
+def test_vote_argument_validation(tmp_path):
+    client = FakeClient()
+    service, _, _ = build(client, tmp_path=tmp_path)
+    expect_guard(lambda: service.vote("bar", TID, 1))
+    expect_guard(lambda: service.vote("thread", "nope", 1))
+    expect_guard(lambda: service.vote("thread", TID, 0))
+    expect_guard(lambda: service.vote("thread", TID, "上"))
+    assert client.calls == []
+    run(service.vote("thread", TID, -1))
+    assert client.count("vote") == 1
+
+
+def test_image_ingest_records_provenance(tmp_path):
+    client = FakeClient(ingest_image={"path": IMG})
+    service, store, _ = build(client, tmp_path=tmp_path)
+    text = run(service.image("ingest", source_url="https://example.com/a.png"))
+    assert IMG in text
+    assert store.owns_image(IMG)
+
+    expect_guard(lambda: service.image("ingest", source_url="ftp://nope/a.png"))
+    expect_guard(lambda: service.image("upload", file_path="不存在的文件.png"))
+
+
+def test_run_history_is_recorded(tmp_path):
+    client = FakeClient()
+    service, store, _ = build(client, tmp_path=tmp_path)
+    service.record_run("heartbeat", "ok", "试跑", "session-1")
+    runs = store.runs()
+    assert runs[0].trigger == "heartbeat"
+    assert runs[0].detail == "试跑"
