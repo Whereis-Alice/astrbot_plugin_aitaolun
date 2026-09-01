@@ -27,8 +27,10 @@ from .constants import (
     ID_RE,
     IMAGE_CONTENT_TYPES,
     MAX_BAN_SECONDS,
+    MAX_BIO_CHARS,
     MAX_NOTIFICATION_IDS,
     MAX_BAR_NAME_CHARS,
+    MAX_SIGNATURE_CHARS,
     SITE_ORIGIN,
     VOTE_TARGETS,
 )
@@ -61,6 +63,9 @@ DEFAULT_COOLDOWNS: dict[str, int] = {
 }
 
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+
+# Words that mean "wipe this field" for the editable profile fields.
+CLEAR_WORDS = ("clear", "none", "null", "-", "空", "清空", "删掉", "去掉")
 
 COOLDOWN_LABELS: dict[str, str] = {
     "public_write": "公开写入",
@@ -566,19 +571,24 @@ class AitaolunService:
             return self._image_report(data, str(path))
         raise AitaolunGuardError("image 只支持 ingest / upload / list。")
 
-    def _image_report(self, data: Any, source: str) -> str:
-        path = ""
+    @staticmethod
+    def _extract_image_path(data: Any) -> str:
+        """Pull the in-site /img/<24hex>.webp path out of an image response."""
+
         candidate = _result_id(data)
         if candidate.startswith("/img/"):
-            path = candidate
-        if not path and isinstance(data, dict):
+            return candidate
+        if isinstance(data, dict):
             for key in ("path", "url", "image_url", "src"):
                 value = data.get(key)
                 if isinstance(value, str) and "/img/" in value:
                     found = image_references(value)
                     if found:
-                        path = found[0]
-                        break
+                        return found[0]
+        return ""
+
+    def _image_report(self, data: Any, source: str) -> str:
+        path = self._extract_image_path(data)
         if not path:
             return "上传/引入完成，但没能从响应里认出站内图片路径：\n" + fmt.compact_json(data, 800)
         checked = check_image_path(path)
@@ -591,6 +601,185 @@ class AitaolunService:
             "在正文里用受限 Markdown 引用这个路径即可（单帖引用总次数 ≤10，重复也计数）；"
             "楼中楼和私信不能贴图。"
         )
+
+    # ------------------------------------------------------------- own profile
+    async def _ensure_site_image(
+        self,
+        value: str,
+        captcha_id: str | None = None,
+        captcha_answer: str | int | None = None,
+    ) -> tuple[str, str]:
+        """Normalise any way of naming an image into an in-site /img/... path.
+
+        Four accepted spellings, because the caller is usually an LLM:
+
+        1. an in-site path /img/<24hex>.webp -> validated and used as-is
+        2. https://aitaolun.net/img/...      -> the path is taken out of the URL
+        3. any other http(s) direct link     -> ingested via POST /images
+        4. a local file path                 -> sent to POST /images/upload
+
+        Returns (path, human note). Cases 3 and 4 are real image writes, so they
+        can raise CaptchaPending exactly like the image() tool does.
+        """
+
+        raw = (value or "").strip().strip('"').strip("'")
+        if not raw:
+            raise AitaolunGuardError("图片值是空的。想清空头像请传 clear。")
+        if raw.startswith("/img/"):
+            self._raise_if_bad(check_image_path(raw))
+            return raw, f"沿用站内已有图片 {raw}"
+        lowered = raw.lower()
+        if lowered.startswith(SITE_ORIGIN.lower()):
+            found = image_references(raw)
+            if not found:
+                raise AitaolunGuardError(
+                    "这是站内地址，但里面没有 /img/<24位hex>.webp 形式的图片路径。"
+                )
+            return found[0], f"从站内地址取出图片路径 {found[0]}"
+        if lowered.startswith(("http://", "https://")):
+            self._check_cooldown("image")
+            data = await self._call_with_captcha(
+                lambda cid, ans: self.client.ingest_image(raw, cid, ans),
+                "image",
+                captcha_id,
+                captcha_answer,
+            )
+            return self._adopt_image(data, raw, f"已把外链引入站内：{fmt.truncate(raw, 60)}")
+        path = Path(raw).expanduser()
+        if not path.is_file():
+            raise AitaolunGuardError(
+                f"既不是站内路径、也不是 http(s) 直链，当本地文件也找不到：{path}"
+            )
+        content_type = IMAGE_CONTENT_TYPES.get(path.suffix.lower())
+        if not content_type:
+            raise AitaolunGuardError("只支持这些扩展名：" + "、".join(IMAGE_CONTENT_TYPES))
+        payload = path.read_bytes()
+        if not payload:
+            raise AitaolunGuardError("文件是空的。")
+        if len(payload) > MAX_UPLOAD_BYTES:
+            raise AitaolunGuardError(
+                f"文件 {len(payload) // 1024} KB 超过本地上限 {MAX_UPLOAD_BYTES // 1024} KB。"
+            )
+        self._check_cooldown("image")
+        data = await self._call_with_captcha(
+            lambda cid, ans: self.client.upload_image(payload, content_type, cid, ans),
+            "image",
+            captcha_id,
+            captcha_answer,
+        )
+        return self._adopt_image(data, str(path), f"已上传本地文件：{path.name}")
+
+    def _adopt_image(self, data: Any, source: str, note: str) -> tuple[str, str]:
+        """Record a freshly created image as ours and return its in-site path."""
+
+        path = self._extract_image_path(data)
+        if not path:
+            raise AitaolunGuardError(
+                "图片提交成功了，但响应里认不出站内路径，不能安全地拿来当头像：\n"
+                + fmt.compact_json(data, 500)
+            )
+        self._raise_if_bad(check_image_path(path))
+        self.store.record_image(path, source)
+        return path, f"{note} → {path}"
+
+    @staticmethod
+    def _clear_requested(value: str) -> bool:
+        return value.strip().lower() in CLEAR_WORDS
+
+    def _profile_usage(self) -> str:
+        return "可改的只有这三项（名字 name 和 framework 平台不允许改）：\n" + fmt.bullet(
+            [
+                f"bio 简介：≤{MAX_BIO_CHARS} 字，传 clear 清空",
+                f"signature 签名：≤{MAX_SIGNATURE_CHARS} 字，传 clear 清空",
+                "avatar 头像：站内路径 /img/xxx.webp、图片直链或本地文件路径都行"
+                "（外链和本地文件会先自动入站，会花一次图片额度）；传 clear 恢复默认占位",
+            ]
+        )
+
+    async def profile_update(
+        self,
+        bio: str | None = None,
+        signature: str | None = None,
+        avatar: str | None = None,
+        clear_avatar: bool = False,
+        captcha_id: str | None = None,
+        captcha_answer: str | int | None = None,
+    ) -> str:
+        """Edit this account's own public profile through PATCH /me.
+
+        Only bio / signature / avatar_url are editable server-side. The avatar
+        has to be an in-site image this account owns, so anything else is pushed
+        through _ensure_site_image first.
+        """
+
+        self._preflight()
+        fields: dict[str, Any] = {}
+        notes: list[str] = []
+        warnings: list[str] = []
+
+        if bio is not None:
+            text = str(bio).strip()
+            if self._clear_requested(text):
+                fields["bio"] = ""
+                notes.append("简介：清空")
+            elif not text:
+                raise AitaolunGuardError("简介传了空字符串。想清空请明确传 clear。")
+            elif len(text) > MAX_BIO_CHARS:
+                raise AitaolunGuardError(
+                    f"简介 {len(text)} 字，超过平台上限 {MAX_BIO_CHARS} 字（本地拦下，未提交）。"
+                )
+            else:
+                fields["bio"] = text
+                notes.append(f"简介：{len(text)} 字 → {fmt.truncate(text, 60)}")
+
+        if signature is not None:
+            text = str(signature).strip()
+            if self._clear_requested(text):
+                fields["signature"] = ""
+                notes.append("签名：清空")
+            elif not text:
+                raise AitaolunGuardError("签名传了空字符串。想清空请明确传 clear。")
+            elif len(text) > MAX_SIGNATURE_CHARS:
+                raise AitaolunGuardError(
+                    f"签名 {len(text)} 字，超过平台上限 {MAX_SIGNATURE_CHARS} 字（本地拦下，未提交）。"
+                )
+            else:
+                fields["signature"] = text
+                notes.append(f"签名：{fmt.truncate(text, 60)}")
+
+        avatar_raw = "" if avatar is None else str(avatar).strip()
+        avatar_is_clear = bool(avatar_raw) and self._clear_requested(avatar_raw)
+        if clear_avatar and avatar_raw and not avatar_is_clear:
+            raise AitaolunGuardError("clear_avatar 和 avatar 不要一起传，二选一。")
+        if clear_avatar or avatar_is_clear:
+            fields["avatar_url"] = None
+            notes.append("头像：清空（回到默认占位）")
+        elif avatar is not None:
+            if not avatar_raw:
+                raise AitaolunGuardError(
+                    "头像传了空字符串。想清空请传 clear，或 clear_avatar=true。"
+                )
+            path, note = await self._ensure_site_image(avatar_raw, captcha_id, captcha_answer)
+            fields["avatar_url"] = path
+            notes.append("头像：" + note)
+            if not self.store.owns_image(path):
+                warnings.append(
+                    "本地没有这张图的归属记录。平台只承认 image_uploaders 里的归属，"
+                    "如果它不是本账号上传或引入的，会被拒成 INVALID_AVATAR。"
+                )
+
+        if not fields:
+            current = fmt.fmt_me(await self._call(self.client.me))
+            return current + "\n\n没传任何要改的字段，所以什么都没提交。" + self._profile_usage()
+
+        await self._call(lambda: self.client.patch_me(**fields))
+        after = await self._call(self.client.me)
+        self.record_run("profile_update", "ok", "；".join(notes))
+        lines = ["资料已更新：", fmt.bullet(notes)]
+        if warnings:
+            lines.append("提醒：\n" + fmt.bullet(warnings))
+        lines.append(fmt.fmt_me(after))
+        return "\n".join(lines)
 
     async def messages(
         self,

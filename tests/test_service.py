@@ -52,6 +52,13 @@ class FakeClient:
         self.results = results
         self.captcha_question = "12 + 5 = ?"
         self.captcha_id = "cap1"
+        self.profile = {
+            "name": "测试机",
+            "claimed": True,
+            "bio": "旧简介",
+            "signature": "",
+            "framework": "AstrBot",
+        }
 
     def _record(self, name, args):
         self.calls.append((name, args))
@@ -108,6 +115,30 @@ class FakeClient:
 
     async def send_message(self, to, body, captcha_id=None, answer=None):
         return self._record("send_message", {"to": to, "body": body})
+
+    async def upload_image(self, payload, content_type, captcha_id=None, answer=None):
+        return self._record(
+            "upload_image", {"bytes": len(payload), "content_type": content_type}
+        )
+
+    async def me(self):
+        self.calls.append(("me", {}))
+        outcome = self.results.get("me")
+        if isinstance(outcome, Exception):
+            raise outcome
+        if callable(outcome):
+            return outcome(self, {})
+        return outcome if outcome is not None else dict(self.profile)
+
+    async def patch_me(self, **fields):
+        self.calls.append(("patch_me", dict(fields)))
+        outcome = self.results.get("patch_me")
+        if isinstance(outcome, Exception):
+            raise outcome
+        # 把改动写回假资料，好让调用方复核时看到新值
+        for key, value in fields.items():
+            self.profile[key] = "" if value is None else value
+        return dict(self.profile)
 
     def count(self, name):
         return sum(1 for item in self.calls if item[0] == name)
@@ -433,3 +464,122 @@ def test_run_history_is_recorded(tmp_path):
     runs = store.runs()
     assert runs[0].trigger == "heartbeat"
     assert runs[0].detail == "试跑"
+
+
+# ------------------------------------------------------------ 改自己的公开资料
+
+
+def test_profile_update_without_fields_just_shows_the_current_profile(tmp_path):
+    client = FakeClient()
+    service, _, _ = build(client, tmp_path=tmp_path)
+    text = run(service.profile_update())
+    assert "本账号资料" in text
+    assert "名字（不可修改）" in text
+    assert "什么都没提交" in text
+    assert "≤500 字" in text and "≤100 字" in text
+    assert client.count("patch_me") == 0
+
+
+def test_profile_update_enforces_the_length_limits_locally(tmp_path):
+    client = FakeClient()
+    service, _, _ = build(client, tmp_path=tmp_path)
+    expect_guard(lambda: service.profile_update(bio="字" * 501), contains="超过平台上限 500")
+    expect_guard(
+        lambda: service.profile_update(signature="字" * 101), contains="超过平台上限 100"
+    )
+    # 一个字都不许提交出去
+    assert client.count("patch_me") == 0
+    # 边界值放行
+    run(service.profile_update(bio="字" * 500, signature="字" * 100))
+    assert client.calls[-2][0] == "patch_me"
+
+
+def test_profile_update_writes_bio_and_signature_and_rereads(tmp_path):
+    client = FakeClient()
+    service, store, _ = build(client, tmp_path=tmp_path)
+    text = run(service.profile_update(bio="一个爱吵架的 bot", signature="嘴很碎"))
+    sent = dict(client.calls[-2][1])
+    assert sent == {"bio": "一个爱吵架的 bot", "signature": "嘴很碎"}
+    # 提交后重新拉一次 /me 复核
+    assert client.calls[-1][0] == "me"
+    assert "资料已更新" in text
+    assert "一个爱吵架的 bot" in text
+    assert store.runs(1)[0].trigger == "profile_update"
+
+
+def test_profile_update_clear_words_blank_the_fields(tmp_path):
+    client = FakeClient()
+    service, _, _ = build(client, tmp_path=tmp_path)
+    run(service.profile_update(bio="clear", signature="清空", clear_avatar=True))
+    sent = dict(client.calls[-2][1])
+    assert sent == {"bio": "", "signature": "", "avatar_url": None}
+    # 空字符串不算清空指令，避免 LLM 手滑就把门面擦掉
+    expect_guard(lambda: service.profile_update(bio="   "), contains="明确传 clear")
+    expect_guard(lambda: service.profile_update(avatar="  "), contains="clear")
+    expect_guard(
+        lambda: service.profile_update(avatar=IMG, clear_avatar=True), contains="二选一"
+    )
+
+
+def test_profile_update_accepts_an_in_site_path_and_warns_when_it_is_not_ours(tmp_path):
+    client = FakeClient()
+    service, store, _ = build(client, tmp_path=tmp_path)
+
+    text = run(service.profile_update(avatar=IMG))
+    assert dict(client.calls[-2][1]) == {"avatar_url": IMG}
+    assert "INVALID_AVATAR" in text  # 没有归属记录 → 提醒但仍然提交
+    assert client.count("upload_image") == 0
+
+    store.record_image(IMG, "早先上传的")
+    text = run(service.profile_update(avatar=IMG))
+    assert "INVALID_AVATAR" not in text
+
+    expect_guard(lambda: service.profile_update(avatar="/img/nope.webp"))
+    expect_guard(lambda: service.profile_update(avatar="ftp://x/a.png"))
+
+
+def test_profile_update_pulls_an_external_link_into_the_site_first(tmp_path):
+    client = FakeClient(ingest_image={"path": IMG})
+    service, store, _ = build(client, tmp_path=tmp_path)
+    text = run(service.profile_update(avatar="https://example.com/face.png"))
+    assert client.count("ingest_image") == 1
+    assert dict(client.calls[-2][1]) == {"avatar_url": IMG}
+    assert store.owns_image(IMG)  # 引入即登记归属
+    assert "INVALID_AVATAR" not in text
+
+
+def test_profile_update_uploads_a_local_file_and_reuses_site_urls(tmp_path):
+    picture = tmp_path / "face.png"
+    picture.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 64)
+    client = FakeClient(upload_image={"path": IMG})
+    service, store, _ = build(client, tmp_path=tmp_path)
+
+    run(service.profile_update(avatar=str(picture)))
+    assert client.count("upload_image") == 1
+    assert store.owns_image(IMG)
+
+    # 完整站内 URL 只是取出路径，不会再花一次图片额度
+    run(service.profile_update(avatar="https://aitaolun.net" + IMG))
+    assert client.count("upload_image") == 1
+    assert dict(client.calls[-2][1]) == {"avatar_url": IMG}
+
+    expect_guard(lambda: service.profile_update(avatar=str(tmp_path / "缺失.png")))
+    bad = tmp_path / "face.bmp"
+    bad.write_bytes(b"BM" + b"0" * 32)
+    expect_guard(lambda: service.profile_update(avatar=str(bad)), contains="扩展名")
+
+
+def test_profile_update_needs_a_credential_and_respects_the_ban_latch(tmp_path):
+    client = FakeClient()
+    service, store, _ = build(client, with_key=False, tmp_path=tmp_path)
+    try:
+        run(service.profile_update(bio="随便"))
+    except AitaolunConfigError as error:
+        assert "api_key" in str(error)
+    else:
+        raise AssertionError("a missing api_key must stop the write")
+    assert client.calls == []
+
+    service, store, _ = build(FakeClient(), tmp_path=tmp_path)
+    store.set_platform_banned(True, "刷屏")
+    expect_guard(lambda: service.profile_update(bio="随便"), contains="本地硬停")

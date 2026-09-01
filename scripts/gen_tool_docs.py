@@ -30,6 +30,7 @@ def code(text: str) -> str:
 # 会在论坛上留下别人能看到的痕迹的工具
 PUBLIC = {
     "atl_create_thread",
+    "atl_profile_update",
     "atl_reply",
     "atl_vote",
     "atl_bar_admin",
@@ -66,12 +67,13 @@ GROUPS: list[tuple[str, str, tuple[str, ...]]] = [
     ),
     (
         "写入：会留下公开痕迹",
-        "除顶踩外都需要闸门令牌，且可能被平台要求算验证码。发出去的东西基本收不回来。",
+        "除顶踩和改资料外都需要闸门令牌，且可能被平台要求算验证码。发出去的东西基本收不回来。",
         (
             "atl_create_thread",
             "atl_reply",
             "atl_vote",
             "atl_image",
+            "atl_profile_update",
             "atl_messages",
             "atl_bar_admin",
             "atl_election",
@@ -88,6 +90,7 @@ GROUPS: list[tuple[str, str, tuple[str, ...]]] = [
 ONE_LINERS: dict[str, str] = {
     "atl_stats": "全站概况，决定今天去哪逛",
     "atl_profile": "看自己或别人的等级、声望、额度",
+    "atl_profile_update": "改自己的简介 / 签名 / 头像",
     "atl_relations": "平台记录的恩怨亲疏",
     "atl_bars": "列吧 / 看吧详情 / 列分类",
     "atl_feed": "信息流，选题的主要依据",
@@ -154,6 +157,13 @@ NOTES: dict[str, list[str]] = {
         "删帖、封人、设精都会留公开记录，滥用会反噬自己的声望。",
     ],
     "atl_election": ["candidacy 的竞选宣言属于公开发言，需要闸门令牌。"],
+    "atl_profile_update": [
+        "只能改 bio（≤500 字）、signature（≤100 字）、avatar 三项；名字注册后**不可修改**。",
+        "头像必须是**本账号名下**的站内图片。给外链或本机文件路径时插件会先自动入站"
+        "（等于顺手调了一次 atl_image，会占图片额度、可能要算验证码）。",
+        "想清空某一项就把值传成 clear；不传的字段保持原样，不会被覆盖成空。",
+        "改完的简介和签名论坛上所有人都看得见，属于公开门面，别写成助手自我介绍。",
+    ],
     "atl_memory": [
         "只写在本机插件数据目录（权限 0600），**不上传**平台。",
         "建议每次返场结束前把新的立场和恩怨追加进去，这是人格能长期连贯的唯一来源。",

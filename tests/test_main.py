@@ -43,6 +43,14 @@ class DummyContext:
     def get_llm_tool_manager(self):
         return self.manager
 
+    def get_config(self, umo=None):
+        # 模拟用户真实的 AstrBot 配置：全角逗号唤醒前缀 + 私聊不要求前缀
+        return {
+            "wake_prefix": ["，"],
+            "provider_settings": {"wake_prefix": ""},
+            "platform_settings": {"friend_message_needs_wake_prefix": False},
+        }
+
 
 class FakeEvent:
     def __init__(
@@ -219,6 +227,12 @@ def test_aliases_only_point_at_implemented_subcommands():
         "runs",
         "gate",
         "whoami",
+        "persona",
+        "diag",
+        "bio",
+        "sign",
+        "signature",
+        "avatar",
         "feed",
         "thread",
         "bars",
@@ -488,3 +502,168 @@ def test_atl_command_reports_permission_errors_instead_of_raising(
 
     event = FakeEvent(private=False, message_str="atl register 爱丽丝")
     assert "只能在私聊里做" in drive(plugin, event)[0]
+
+
+# ------------------------------------------------------- wake prefix / 注入诊断
+
+
+def test_wake_prefix_for_injection_covers_every_branch():
+    # 没有任何前缀配置 → 只能靠 @自己
+    assert main.wake_prefix_for_injection([], "") == ""
+    # 取第一个非空的 bot 前缀，右侧空格是有意义的，只 lstrip
+    assert main.wake_prefix_for_injection(["", "  / "], "") == "/ "
+    assert main.wake_prefix_for_injection("，", "") == "，"
+    # provider_settings.wake_prefix 与 bot 前缀重复的那一段由框架去掉
+    assert main.wake_prefix_for_injection(["/"], "/chat ") == "/chat "
+    assert main.wake_prefix_for_injection(["，"], "聊天 ") == "，聊天 "
+    # 配置项可以强制覆盖，写 none 表示彻底不加前缀
+    assert main.wake_prefix_for_injection(["，"], "", "!") == "!"
+    assert main.wake_prefix_for_injection(["，"], "", " none ") == ""
+    assert main.wake_prefix_for_injection(["，"], "", "无") == ""
+
+
+def test_wake_verdict_mirrors_the_waking_check_stage():
+    ok, why = main.wake_verdict("GroupMessage", "，", "", ["，"], False)
+    assert ok and "唤醒前缀" in why
+    # 没有可用前缀但记下了自己的 ID → @自己 也算唤醒
+    ok, why = main.wake_verdict("GroupMessage", "", "bot-1", [], False)
+    assert ok and "@bot-1" in why
+    ok, why = main.wake_verdict("FriendMessage", "", "", [], False)
+    assert ok and "私聊" in why
+    # 群聊 + 没前缀 + 没 self_id：这就是「注入了但毫无反应」的根因
+    ok, why = main.wake_verdict("GroupMessage", "", "", [], False)
+    assert not ok and "WakingCheckStage" in why and "群聊" in why
+    ok, why = main.wake_verdict("FriendMessage", "", "", [], True)
+    assert not ok and "必须带前缀" in why
+
+
+def captured_injection(plugin, monkeypatch):
+    """替掉 StarTools 的两个静态方法，把注入的参数抓回来。"""
+
+    box = {}
+
+    async def fake_create_message(**kwargs):
+        box.update(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    async def fake_create_event(abm, platform="", is_wake=False):
+        box["platform"] = platform
+        box["is_wake"] = is_wake
+        return None
+
+    monkeypatch.setattr(
+        main.StarTools, "create_message", staticmethod(fake_create_message)
+    )
+    monkeypatch.setattr(main.StarTools, "create_event", staticmethod(fake_create_event))
+    return box
+
+
+def test_wake_injects_the_prefix_and_an_at_self_segment(tmp_path, monkeypatch):
+    plugin, _ = wired(tmp_path, monkeypatch, {"heartbeat_include_brief": False})
+    dispatch(plugin, "bind")
+    box = captured_injection(plugin, monkeypatch)
+
+    run(plugin._wake("heartbeat", "该返场了"))
+
+    assert box["is_wake"] is True
+    assert box["platform"] == "aiocqhttp"
+    assert box["self_id"] == "bot-1"
+    # 文本自带唤醒前缀
+    assert box["message_str"] == "，该返场了"
+    # 消息链第一段是 @自己，这是第二道保险
+    assert isinstance(box["message"][0], main.At)
+    assert str(box["message"][0].qq) == "bot-1"
+    assert box["message"][1].text == "，该返场了"
+
+    state = plugin.store.scheduler_state()
+    assert state["last_error"] == ""
+    runs = plugin.store.runs(1)
+    assert runs[0].status == "injected" and "@自己" in runs[0].detail
+
+
+def test_wake_records_injection_failures(tmp_path, monkeypatch):
+    plugin, _ = wired(tmp_path, monkeypatch, {"heartbeat_include_brief": False})
+    dispatch(plugin, "bind")
+
+    async def boom(**kwargs):
+        raise RuntimeError("平台没连上")
+
+    monkeypatch.setattr(main.StarTools, "create_message", staticmethod(boom))
+    run(plugin._wake("heartbeat", "该返场了"))
+
+    assert "平台没连上" in plugin.store.scheduler_state()["last_error"]
+    assert plugin.store.runs(1)[0].status == "inject_failed"
+
+
+def test_diag_explains_whether_the_injection_will_wake_the_bot(tmp_path, monkeypatch):
+    plugin, _ = wired(tmp_path, monkeypatch)
+    assert "先在你想让它说话的那个会话里执行 /atl bind" in dispatch(plugin, "diag")
+
+    dispatch(plugin, "bind")
+    text = dispatch(plugin, "diag")
+    assert "返场注入诊断" in text
+    assert "aiocqhttp:FriendMessage:sess-1" in text
+    assert "会被唤醒 ✅" in text
+    assert "'，'" in text  # 自动读到的唤醒前缀
+    assert "还没跑过" in text
+
+
+def test_diag_flags_a_group_binding_without_any_wake_signal(tmp_path, monkeypatch):
+    plugin, context = wired(tmp_path, monkeypatch, {"heartbeat_wake_prefix": "none"})
+    monkeypatch.setattr(context, "get_config", lambda umo=None: {}, raising=False)
+    dispatch(plugin, "bind", event=FakeEvent(private=False, group_id="g-1"))
+    # 手动抹掉 self_id，模拟老版本 bind 留下的残缺状态
+    plugin.store.update_scheduler_state(self_id="", msg_type="GroupMessage")
+
+    text = dispatch(plugin, "diag")
+    assert "不会被唤醒 ❌" in text
+    assert "群聊" in text
+    assert "重新 bind" in text
+
+
+def test_persona_lists_all_four_layers(tmp_path, monkeypatch):
+    plugin, _ = wired(tmp_path, monkeypatch)
+    text = dispatch(plugin, "persona")
+    for marker in ("人格情景", "/atl bio", "atl_memory", "heartbeat_prompt"):
+        assert marker in text
+    assert "用内置默认" in text
+
+    plugin, _ = wired(tmp_path, monkeypatch, {"heartbeat_prompt": "只逛技术吧"})
+    assert "已自定义" in dispatch(plugin, "persona")
+
+
+def test_profile_subcommands_require_admin_and_forward_the_whole_line(
+    tmp_path, monkeypatch
+):
+    plugin, _ = wired(tmp_path, monkeypatch)
+    calls = []
+
+    async def fake_update(**kwargs):
+        calls.append(kwargs)
+        return "ok"
+
+    monkeypatch.setattr(plugin.service, "profile_update", fake_update)
+
+    assert dispatch(plugin, "bio", ["一个", "爱吵架的", "bot"]) == "ok"
+    assert dispatch(plugin, "sign", ["嘴", "很", "碎"]) == "ok"
+    assert dispatch(plugin, "signature", ["嘴碎"]) == "ok"
+    assert dispatch(plugin, "avatar", ["/img/" + "a" * 24 + ".webp"]) == "ok"
+    assert calls == [
+        {"bio": "一个 爱吵架的 bot"},
+        {"signature": "嘴 很 碎"},
+        {"signature": "嘴碎"},
+        {"avatar": "/img/" + "a" * 24 + ".webp"},
+    ]
+
+    # 不带参数 = 查看当前资料和用法
+    calls.clear()
+    assert dispatch(plugin, "bio") == "ok"
+    assert calls == [{}]
+
+    for sub in ("bio", "sign", "avatar"):
+        try:
+            dispatch(plugin, sub, ["x"], FakeEvent(admin=False))
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("%s must require admin" % sub)

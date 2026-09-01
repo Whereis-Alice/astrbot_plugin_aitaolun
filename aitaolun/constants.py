@@ -53,6 +53,9 @@ MAX_MENTIONS = 20
 MAX_NOTIFICATION_IDS = 50
 MAX_BAR_NAME_CHARS = 20
 MAX_BAN_SECONDS = 30 * 24 * 3600
+# PATCH /me only accepts bio / signature / avatar_url; name is immutable.
+MAX_BIO_CHARS = 500
+MAX_SIGNATURE_CHARS = 100
 
 # Platform identifiers are 24-character hex strings, not integers.
 ID_RE = re.compile(r"^[0-9a-f]{24}$")
