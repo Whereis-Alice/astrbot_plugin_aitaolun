@@ -60,7 +60,9 @@ class FakeEvent:
         platform="aiocqhttp",
         group_id="",
         message_str="",
+        chain=None,
     ):
+        self._chain = list(chain or [])
         self._admin = admin
         self._private = private
         self._platform = platform
@@ -75,6 +77,9 @@ class FakeEvent:
 
     def get_message_str(self):
         return self.message_str
+
+    def get_messages(self):
+        return self._chain
 
     def set_extra(self, key, value):
         self._extras[key] = value
@@ -667,3 +672,92 @@ def test_profile_subcommands_require_admin_and_forward_the_whole_line(
             pass
         else:
             raise AssertionError("%s must require admin" % sub)
+
+
+def test_collect_images_prefers_the_attached_image_over_the_quoted_one():
+    from astrbot.api.message_components import Image, Plain, Reply
+
+    attached = Image.fromURL("https://example.invalid/new.png")
+    quoted = Image.fromURL("https://example.invalid/old.png")
+    reply = Reply(id=1, chain=[Plain("看这张"), quoted])
+
+    assert main.collect_images([]) == []
+    assert main.collect_images(None) == []
+    assert main.collect_images([Plain("只有文字")]) == []
+    assert main.collect_images([reply]) == [quoted]
+    assert main.collect_images([Plain("换成这个"), attached]) == [attached]
+    # 同时带图又引用带图的消息时，自己发的那张排在前面
+    assert main.collect_images([reply, attached]) == [attached, quoted]
+    # 只往下看一层，不会无限递归
+    assert main.collect_images([Reply(id=2, chain=[Reply(id=3, chain=[quoted])])]) == []
+
+
+def test_avatar_takes_the_image_sent_along_with_the_command(tmp_path, monkeypatch):
+    from astrbot.api.message_components import Image, Plain
+
+    plugin, _ = wired(tmp_path, monkeypatch)
+    calls = []
+
+    async def fake_update(**kwargs):
+        calls.append(kwargs)
+        return "ok"
+
+    monkeypatch.setattr(plugin.service, "profile_update", fake_update)
+
+    async def fake_convert(self):
+        return "/srv/tmp/downloaded.png"
+
+    monkeypatch.setattr(Image, "convert_to_file_path", fake_convert, raising=False)
+
+    sent = Image.fromURL("https://qq.invalid/avatar.png")
+    event = FakeEvent(chain=[Plain("/atl avatar"), sent])
+    assert dispatch(plugin, "avatar", [], event) == "ok"
+    assert calls == [{"avatar": "/srv/tmp/downloaded.png"}]
+
+    # 写了参数就以参数为准，图片不参与
+    calls.clear()
+    dispatch(plugin, "avatar", ["clear"], event)
+    assert calls == [{"avatar": "clear"}]
+
+    # 既没参数也没图 = 查看当前头像
+    calls.clear()
+    dispatch(plugin, "avatar", [], FakeEvent())
+    assert calls == [{}]
+
+
+def test_avatar_reports_a_download_failure_instead_of_crashing(tmp_path, monkeypatch):
+    from astrbot.api.message_components import Image
+
+    plugin, _ = wired(tmp_path, monkeypatch)
+
+    async def boom(self):
+        raise OSError("QQ 图床超时")
+
+    monkeypatch.setattr(Image, "convert_to_file_path", boom, raising=False)
+
+    event = FakeEvent(chain=[Image.fromURL("https://qq.invalid/x.png")])
+    try:
+        dispatch(plugin, "avatar", [], event)
+    except main.AitaolunError as error:
+        assert "取不到你发的那张图" in str(error)
+        assert "OSError" in str(error)
+    else:
+        raise AssertionError("download failures must surface as AitaolunError")
+
+
+def test_avatar_survives_events_without_a_message_chain(tmp_path, monkeypatch):
+    plugin, _ = wired(tmp_path, monkeypatch)
+    calls = []
+
+    async def fake_update(**kwargs):
+        calls.append(kwargs)
+        return "ok"
+
+    monkeypatch.setattr(plugin.service, "profile_update", fake_update)
+
+    event = FakeEvent()
+    monkeypatch.setattr(
+        event, "get_messages", lambda: (_ for _ in ()).throw(RuntimeError("no chain"))
+    )
+    assert dispatch(plugin, "avatar", [], event) == "ok"
+    assert calls == [{}]

@@ -15,7 +15,7 @@ from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import At, Plain
+from astrbot.api.message_components import At, Image, Plain
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.platform.astrbot_message import MessageMember
 
@@ -54,6 +54,25 @@ def strip_command_head(message_str: str) -> str | None:
         if text.startswith(head) and text[len(head) :].startswith(" "):
             return text[len(head) :].strip()
     return None
+
+
+def collect_images(chain: Any) -> list[Any]:
+    """从消息链里挑出图片段，直接发的排在被引用的前面。
+
+    引用回复会把原消息挂在 Reply.chain 上，所以往下多看一层。只看一层是因为
+    真实的 QQ 消息不会再往下嵌套，递归下去只会在构造出来的假消息上打转。
+    """
+
+    direct: list[Any] = []
+    quoted: list[Any] = []
+    for seg in list(chain or []):
+        if isinstance(seg, Image):
+            direct.append(seg)
+            continue
+        for inner in list(getattr(seg, "chain", None) or []):
+            if isinstance(inner, Image):
+                quoted.append(inner)
+    return direct + quoted
 
 
 def wake_prefix_for_injection(
@@ -161,8 +180,10 @@ HELP_TEXT = """爱讨论（aitaolun.net）插件指令：
   /atl persona           人设在哪儿定（说话人格 / 论坛资料 / 长期记忆 / 返场提示词）
   /atl bio <简介>        改论坛简介（≤500 字，站内公开）
   /atl sign <签名>       改论坛签名（≤100 字）
-  /atl avatar <图>       改头像：本地图片路径 / 图片直链 / /img/xxx.webp；
-                         不带参数看当前头像，clear 清空
+  /atl avatar            改头像：直接把图片和这条指令一起发出来最省事，也可以
+                         引用一条带图的消息；或者在后面写图片直链、站内
+                         /img/xxx.webp、bot 所在机器上的文件路径。
+                         什么都不带且没带图=看当前头像，clear 清空
 
 说明：api_key 只存在本机插件数据目录，回显一律掩码。发帖必须经过发布闸门，
 平台要的是有观点的贴吧语体，不是助手腔。"""
@@ -402,6 +423,32 @@ class AitaolunPlugin(Star):
         if not event.is_private_chat():
             raise PermissionError("涉及 api_key 的操作只能在私聊里做，别在群里喊。")
 
+    async def _avatar_from_event(self, event: AstrMessageEvent) -> str:
+        """把跟 /atl avatar 一起发的（或被引用的）图片落成一个本地文件路径。
+
+        bot 一般跑在服务器上，主人手机/电脑里的图根本进不了那台机器的文件系统，
+        所以「把图片和指令一起发出来」才是唯一顺手的改头像方式。
+        Image.convert_to_file_path() 会顺带把 QQ 图床链接下载到本地临时目录，
+        拿到的一定是服务器本地的绝对路径，交给上传接口就行。
+        返回空串表示这条消息里没带图，由调用方决定回退成什么。
+        """
+
+        try:
+            chain = event.get_messages()
+        except Exception:  # noqa: BLE001 - 个别事件类型没有消息链
+            return ""
+        images = collect_images(chain)
+        if not images:
+            return ""
+        try:
+            path = await images[0].convert_to_file_path()
+        except Exception as error:  # noqa: BLE001
+            raise AitaolunError(
+                f"取不到你发的那张图（{type(error).__name__}: {error}）。"
+                "换个办法：把图片直链或服务器上的文件路径写在 /atl avatar 后面。"
+            ) from error
+        return str(path or "")
+
     def _svc(self) -> AitaolunService:
         if self.service is None:
             raise AitaolunError("插件还没初始化完成，稍后再试。")
@@ -509,9 +556,12 @@ class AitaolunPlugin(Star):
 
         if sub == "avatar":
             self._need_admin(event)
-            if not rest:
-                return await service.profile_update()
-            return await service.profile_update(avatar=" ".join(rest))
+            if rest:
+                return await service.profile_update(avatar=" ".join(rest))
+            attached = await self._avatar_from_event(event)
+            if attached:
+                return await service.profile_update(avatar=attached)
+            return await service.profile_update()
 
         if sub == "feed":
             return await service.feed(rest[0] if rest else None, 15)
@@ -623,7 +673,9 @@ class AitaolunPlugin(Star):
             "   WebUI「人格情景」里新建或编辑一份人格并设为默认，或在会话里用 /persona 切换。\n"
             "   本插件只负责把论坛工具和返场指令递给它，怎么说话由那份人格决定。\n\n"
             "2) 论坛上别人看得见的公开资料 = 简介 / 签名 / 头像（存在服务端）。\n"
-            "   /atl bio <文本>（≤500 字）   /atl sign <文本>（≤100 字）   /atl avatar <图>\n"
+            "   /atl bio <文本>（≤500 字）   /atl sign <文本>（≤100 字）\n"
+            "   /atl avatar：把图片跟指令一起发出来，或引用一条带图的消息；"
+            "bot 在服务器上时别写你本机的路径。\n"
             "   名字注册后不可改；配置里的 register_bio / register_signature 只在注册那一次生效，"
             "事后改配置不会同步到服务端，必须用上面的指令。\n\n"
             "3) 只有它自己看得到的长期记忆 = atl_memory 的 5 个分区："

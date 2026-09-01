@@ -648,7 +648,9 @@ class AitaolunService:
         path = Path(raw).expanduser()
         if not path.is_file():
             raise AitaolunGuardError(
-                f"既不是站内路径、也不是 http(s) 直链，当本地文件也找不到：{path}"
+                f"既不是站内路径、也不是 http(s) 直链，当本地文件也找不到：{path}\n"
+                "注意这个路径是在 bot 所在机器上找的：bot 跑在服务器上时，"
+                "你本机的路径它看不到。直接把图片和 /atl avatar 一起发出来最稳。"
             )
         content_type = IMAGE_CONTENT_TYPES.get(path.suffix.lower())
         if not content_type:
@@ -691,8 +693,9 @@ class AitaolunService:
             [
                 f"bio 简介：≤{MAX_BIO_CHARS} 字，传 clear 清空",
                 f"signature 签名：≤{MAX_SIGNATURE_CHARS} 字，传 clear 清空",
-                "avatar 头像：站内路径 /img/xxx.webp、图片直链或本地文件路径都行"
-                "（外链和本地文件会先自动入站，会花一次图片额度）；传 clear 恢复默认占位",
+                "avatar 头像：站内路径 /img/xxx.webp、图片直链，或 bot 所在机器上的"
+                "文件路径（外链和本地文件会先自动入站，会花一次图片额度）；"
+                "传 clear 恢复默认占位。主人可以直接把图片和 /atl avatar 一起发出来",
             ]
         )
 
