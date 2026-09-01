@@ -45,7 +45,14 @@ class DummyContext:
 
 
 class FakeEvent:
-    def __init__(self, admin=True, private=True, platform="aiocqhttp", group_id=""):
+    def __init__(
+        self,
+        admin=True,
+        private=True,
+        platform="aiocqhttp",
+        group_id="",
+        message_str="",
+    ):
         self._admin = admin
         self._private = private
         self._platform = platform
@@ -53,6 +60,21 @@ class FakeEvent:
         self.session_id = "sess-1"
         self.unified_msg_origin = "%s:FriendMessage:sess-1" % platform
         self.replies = []
+        # 唤醒前缀在进入过滤器之前就已经被 AstrBot 剥掉了，这里模拟剥完的原文
+        self.message_str = message_str
+        self.is_at_or_wake_command = True
+        self._extras = {}
+
+    def get_message_str(self):
+        return self.message_str
+
+    def set_extra(self, key, value):
+        self._extras[key] = value
+
+    def get_extra(self, key=None, default=None):
+        if key is None:
+            return self._extras
+        return self._extras.get(key, default)
 
     def is_admin(self):
         return self._admin
@@ -357,3 +379,112 @@ def test_wake_without_a_binding_records_the_reason(tmp_path, monkeypatch):
     plugin, _ = wired(tmp_path, monkeypatch)
     run(plugin._wake("heartbeat", "prompt"))
     assert plugin.store.scheduler_state()["last_error"] == "未绑定会话"
+
+
+# ------------------------------------------------------------ argument parsing
+
+
+def drive(plugin, event):
+    """跑真正的 /atl 指令入口（异步生成器），返回它 yield 出来的文本。"""
+
+    async def collect():
+        return [item async for item in plugin.atl_command(event)]
+
+    return run(collect())
+
+
+def test_parse_arg_line_keeps_every_token_after_the_command_head():
+    cases = {
+        "atl register 爱丽丝": "register 爱丽丝",
+        "/atl register 爱丽丝": "register 爱丽丝",
+        "！atl   register    爱丽丝  ": "register 爱丽丝",
+        "爱讨论 注册 爱丽丝": "注册 爱丽丝",
+        "atl": "",
+        "/atl": "",
+        "爱讨论": "",
+        "atl memory write notes 今天吧里很吵": "memory write notes 今天吧里很吵",
+    }
+    for raw, expected in cases.items():
+        assert main.parse_arg_line(raw) == expected, raw
+
+
+def test_parse_arg_line_falls_back_when_the_raw_text_is_unusable():
+    assert main.parse_arg_line("", "register 爱丽丝") == "register 爱丽丝"
+    assert main.parse_arg_line(None, None) == ""
+    # 只是碰巧以 atl 开头的普通词，不算指令头，退回框架给的值
+    assert main.parse_arg_line("atlas 很大", "status") == "status"
+
+
+def test_astrbot_command_filter_has_nothing_left_to_swallow():
+    """真·AstrBot 过滤器跑一遍：处理函数不声明参数，框架分词就吃不掉东西。
+
+    历史 bug：`args: GreedyStr = ""` 因为带了默认值，CommandFilter 把默认值而不是
+    注解记进 handler_params，贪婪判定失效，`/atl register 爱丽丝` 只传了 "register"。
+    """
+
+    from astrbot.core.star.filter.command import CommandFilter
+
+    cmd_filter = CommandFilter(
+        "atl",
+        alias={"爱讨论"},
+        handler_md=SimpleNamespace(handler=main.AitaolunPlugin.atl_command),
+    )
+    assert cmd_filter.handler_params == {}
+
+    event = FakeEvent(message_str="atl register 爱丽丝")
+    assert cmd_filter.filter(event, {}) is True
+    assert event.get_extra("parsed_params") == {}
+    assert main.parse_arg_line(event.get_message_str()) == "register 爱丽丝"
+
+
+def test_atl_command_hands_the_agent_name_to_register(tmp_path, monkeypatch):
+    plugin, _ = wired(tmp_path, monkeypatch)
+    calls = []
+
+    async def fake_register(name, bio, signature, framework):
+        calls.append((name, bio, signature, framework))
+        return name, API_KEY, "https://aitaolun.net/claim/abc"
+
+    monkeypatch.setattr(plugin.service, "register", fake_register)
+    replies = drive(plugin, FakeEvent(message_str="atl register 爱丽丝"))
+
+    assert [call[0] for call in calls] == ["爱丽丝"]
+    assert "用法：/atl register" not in replies[0]
+    assert "注册成功：爱丽丝" in replies[0]
+    assert API_KEY not in replies[0]
+    assert plugin.store.credentials().agent_name == "爱丽丝"
+
+
+def test_register_keeps_spaces_inside_the_agent_name(tmp_path, monkeypatch):
+    plugin, _ = wired(tmp_path, monkeypatch)
+    seen = []
+
+    async def fake_register(name, bio, signature, framework):
+        seen.append(name)
+        return name, API_KEY, ""
+
+    monkeypatch.setattr(plugin.service, "register", fake_register)
+    drive(plugin, FakeEvent(message_str="atl 注册 Alice B"))
+    assert seen == ["Alice B"]
+
+
+def test_atl_command_handles_the_chinese_head_bare_calls_and_typos(
+    tmp_path, monkeypatch
+):
+    plugin, _ = wired(tmp_path, monkeypatch)
+    ready(plugin)
+
+    assert "爱讨论插件状态" in drive(plugin, FakeEvent(message_str="爱讨论 状态"))[0]
+    assert drive(plugin, FakeEvent(message_str="atl"))[0] == main.HELP_TEXT
+    assert "未知子指令" in drive(plugin, FakeEvent(message_str="atl 胡说八道"))[0]
+
+
+def test_atl_command_reports_permission_errors_instead_of_raising(
+    tmp_path, monkeypatch
+):
+    plugin, _ = wired(tmp_path, monkeypatch)
+    event = FakeEvent(admin=False, message_str="atl register 爱丽丝")
+    assert "只有 AstrBot 管理员" in drive(plugin, event)[0]
+
+    event = FakeEvent(private=False, message_str="atl register 爱丽丝")
+    assert "只能在私聊里做" in drive(plugin, event)[0]

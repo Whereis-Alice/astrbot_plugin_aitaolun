@@ -9,6 +9,7 @@ aitaolun.net 是一个只有 AI 能发言、人类只能围观的中文贴吧。
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
 
@@ -17,7 +18,6 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.platform.astrbot_message import MessageMember
-from astrbot.core.star.filter.command import GreedyStr
 
 from .aitaolun import formatting as fmt
 from .aitaolun.api import AitaolunClient
@@ -31,6 +31,45 @@ from .aitaolun.state import Credentials, StateStore, mask_key
 from .aitaolun.tools import build_tools, tool_names
 
 PLUGIN_NAME = "astrbot_plugin_aitaolun"
+
+#: 指令头，含中文别名。AstrBot 在进入过滤器之前就把唤醒前缀（/ ! 等）从
+#: event.message_str 里剥掉了，这里仍然容错前缀，免得换个版本或换个平台就失灵。
+COMMAND_HEADS = ("atl", "爱讨论")
+_HEAD_PREFIX_CHARS = "/!！.。#>》、,，:：~～ \t"
+
+
+def strip_command_head(message_str: str) -> str | None:
+    """把 `atl xxx` / `爱讨论 xxx` 的指令头剥掉，返回后面的参数串。
+
+    不是本插件的指令（或者根本拿不到原文）时返回 None，让调用方回退。
+    """
+
+    text = re.sub(r"\s+", " ", str(message_str or "")).strip()
+    if not text:
+        return None
+    text = text.lstrip(_HEAD_PREFIX_CHARS)
+    for head in COMMAND_HEADS:
+        if text == head:
+            return ""
+        if text.startswith(head) and text[len(head) :].startswith(" "):
+            return text[len(head) :].strip()
+    return None
+
+
+def parse_arg_line(message_str: str, fallback: str = "") -> str:
+    """解析 `/atl` 后面的参数串，不依赖框架的参数分词。
+
+    AstrBot 的 CommandFilter 只在参数「没有默认值」时才把 GreedyStr 注解当成
+    贪婪参数：写成 `args: GreedyStr = ""` 会退化成只传第一个 token，
+    `/atl register 爱丽丝` 就变成了 `args="register"`，名字被吃掉。
+    所以这里一律以事件原文为准，框架传进来的值只当兜底。
+    """
+
+    parsed = strip_command_head(message_str)
+    if parsed is not None:
+        return parsed
+    return re.sub(r"\s+", " ", str(fallback or "")).strip()
+
 
 HELP_TEXT = """爱讨论（aitaolun.net）插件指令：
 
@@ -212,10 +251,14 @@ class AitaolunPlugin(Star):
     }
 
     @filter.command("atl", alias={"爱讨论"})
-    async def atl_command(self, event: AstrMessageEvent, args: GreedyStr = ""):
+    async def atl_command(self, event: AstrMessageEvent):
         """爱讨论论坛插件控制台，用 /atl help 看全部指令。"""
 
-        parts = str(args or "").split()
+        try:
+            raw_message = event.get_message_str()
+        except Exception:  # noqa: BLE001 - 少数事件类型可能没有文本原文
+            raw_message = ""
+        parts = parse_arg_line(raw_message).split()
         raw = parts[0] if parts else ""
         sub = self._ALIASES.get(raw, raw.lower() or "help")
         rest = parts[1:]
@@ -394,7 +437,7 @@ class AitaolunPlugin(Star):
                 "本地已经有凭据了（" + mask_key(self.store.credentials().api_key) + "）。"
                 "要换身份请先 /atl key clear，注意旧账号的 api_key 一旦丢失无法找回。"
             )
-        name = rest[0]
+        name = " ".join(rest).strip()
         bio = str(self._opt("register_bio", "") or "").strip() or "一个用 AstrBot 跑的 agent。"
         signature = str(self._opt("register_signature", "") or "").strip()
         agent_name, api_key, claim_url = await self._svc().register(
