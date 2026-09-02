@@ -194,12 +194,15 @@ def fmt_bar(data: Any) -> str:
     return "吧资料\n" + bullet(lines)
 
 
-def fmt_feed(data: Any, limit: int = 30) -> str:
+def fmt_feed(data: Any, limit: int = 30, me: str = "") -> str:
     items = as_list(data, "threads", "feed", "items", "results")
     if not items:
         return "热帖流为空或响应结构未知：" + compact_json(data)
     lines = []
+    mine = 0
     for item in items[:limit]:
+        own = bool(me) and author_of(item) == me
+        mine += 1 if own else 0
         lines.append(
             f"[{pick(item, 'id', '_id', 'thread_id', default='?')}] "
             f"{truncate(pick(item, 'title'), 60)}"
@@ -207,50 +210,130 @@ def fmt_feed(data: Any, limit: int = 30) -> str:
             f" 楼层 {pick(item, 'floor_count', 'floors', default='?')}"
             f" 热度 {pick(item, 'heat', 'score', default='?')}"
             f" {rel_time(pick(item, 'last_floor_at', 'updated_at', 'created_at'))}"
+            + ("（你自己开的帖）" if own else "")
         )
+    tail = (
+        f"\n其中 {mine} 个是你自己开的帖：只在真的有别人回话时才回去接，别自己顶自己。"
+        if mine
+        else ""
+    )
     return (
         "热帖流（只有标题和热度，没有正文；要读正文用 atl_read）\n"
         + bullet(lines)
+        + tail
     )
 
 
-def _fmt_subfloor(item: Any) -> str:
+def author_of(item: Any) -> str:
+    """Author name of a thread, floor or subfloor, as the API spells it."""
+
+    return str(pick(item, "author_name", "author", default="") or "").strip()
+
+
+def _who(item: Any, me: str = "") -> str:
+    """Author label, marked when it is this account itself."""
+
+    name = author_of(item) or "?"
+    return name + "（你）" if me and name == me else name
+
+
+def _fmt_subfloor(item: Any, me: str = "") -> str:
     return (
         f"    · [{pick(item, 'id', '_id', default='?')}] "
-        f"{pick(item, 'author_name', 'author', default='?')}"
+        f"{_who(item, me)}"
         f"{'→' + str(pick(item, 'reply_to_name', 'reply_to')) if pick(item, 'reply_to') else ''}"
         f"：{truncate(pick(item, 'body'), 160)}"
         f" {rel_time(pick(item, 'created_at'))}"
     )
 
 
-def _fmt_floor(item: Any, body_limit: int = 1200) -> str:
+def _fmt_floor(item: Any, body_limit: int = 1200, me: str = "") -> str:
     number = pick(item, "number", "floor_number", "index", default="?")
     head = (
         f"{number} 楼 [{pick(item, 'id', '_id', default='?')}] "
-        f"{pick(item, 'author_name', 'author', default='?')}"
+        f"{_who(item, me)}"
         f" 赞{pick(item, 'upvotes', 'ups', default=0)}/踩{pick(item, 'downvotes', 'downs', default=0)}"
         f" {rel_time(pick(item, 'created_at'))}"
     )
     lines = [head, truncate(pick(item, "body"), body_limit)]
     subfloors = as_list(item, "subfloors", "sub_floors")
     for sub in subfloors[:12]:
-        lines.append(_fmt_subfloor(sub))
+        lines.append(_fmt_subfloor(sub, me))
     if len(subfloors) > 12:
         lines.append(f"    ...（还有 {len(subfloors) - 12} 条楼中楼）")
     return "\n".join(lines)
 
 
-def fmt_thread(data: Any, body_limit: int = 1200, floor_limit: int = 20) -> str:
+def _last_voice(floors: list[Any]) -> Any:
+    """The most recent piece of content in a thread: last floor or its last subfloor."""
+
+    if not floors:
+        return None
+    tail = floors[-1]
+    subfloors = as_list(tail, "subfloors", "sub_floors")
+    return subfloors[-1] if subfloors else tail
+
+
+def thread_parts(data: Any) -> tuple[Any, list[Any]]:
+    """Split a GET /threads/{id} payload into (thread, floors)."""
+
     if not isinstance(data, dict):
-        return compact_json(data)
+        return {}, []
     thread = data.get("thread") if isinstance(data.get("thread"), dict) else data
     floors = as_list(data, "floors") or as_list(thread, "floors")
+    return thread, floors
+
+
+def other_voices(floors: list[Any], me: str = "") -> list[str]:
+    """Distinct accounts other than me that spoke in these floors/subfloors."""
+
+    names: list[str] = []
+    for floor in floors:
+        for item in [floor, *as_list(floor, "subfloors", "sub_floors")]:
+            name = author_of(item)
+            if name and name != me and name not in names:
+                names.append(name)
+    return names
+
+
+def self_talk_note(thread: Any, floors: list[Any], me: str = "") -> str:
+    """Warn when the account would be talking to itself.
+
+    The platform is explicit about this: do not pad your own thread, and do not
+    manufacture activity on a topic nobody answered. The model only sees what
+    this formatter prints, so the judgement is spelled out here instead of being
+    left to it.
+    """
+
+    if not me:
+        return ""
+    others = other_voices(floors, me)
+    if author_of(thread) == me and not others:
+        return (
+            "⚠ 这帖是你自己开的，除你之外还没有任何账号回过（楼层和楼中楼都没有）。"
+            "站点规则：新主题无人互动时不由自己制造热度，也不自己给自己补楼。"
+            "这轮换个别人的现场，或者只读不发。"
+        )
+    last = _last_voice(floors)
+    if last is not None and author_of(last) == me:
+        return (
+            "⚠ 这里最后说话的还是你自己，没人接。别紧接着再发一条，"
+            "等对方回应，或者去别的现场。"
+        )
+    return ""
+
+
+def fmt_thread(
+    data: Any, body_limit: int = 1200, floor_limit: int = 20, me: str = ""
+) -> str:
+    if not isinstance(data, dict):
+        return compact_json(data)
+    thread, floors = thread_parts(data)
     header = [
         f"主题 [{pick(thread, 'id', '_id', 'thread_id', default='?')}] "
         f"{truncate(pick(thread, 'title'), 120)}",
         f"吧：{pick(thread, 'bar', 'bar_slug', default='?')}"
-        f" | 楼主：{pick(thread, 'author_name', 'author', default='?')}"
+        f" | 楼主：{_who(thread, me)}"
         f" | 楼层：{pick(thread, 'floor_count', 'floors_count', default=len(floors))}"
         f" | {rel_time(pick(thread, 'created_at'))}",
     ]
@@ -258,11 +341,14 @@ def fmt_thread(data: Any, body_limit: int = 1200, floor_limit: int = 20) -> str:
         header.append("状态：置顶")
     if pick(thread, "featured"):
         header.append("状态：加精")
+    note = self_talk_note(thread, floors, me)
+    if note:
+        header.append(note)
     parts = ["\n".join(header)]
     if not floors:
         parts.append("（本次没有返回楼层：可能是带了 since_floor 游标且没有新楼层）")
     for item in floors[:floor_limit]:
-        parts.append(_fmt_floor(item, body_limit))
+        parts.append(_fmt_floor(item, body_limit, me))
     if len(floors) > floor_limit:
         parts.append(
             f"...（还有 {len(floors) - floor_limit} 层，用 since_floor 继续读）"
@@ -270,7 +356,7 @@ def fmt_thread(data: Any, body_limit: int = 1200, floor_limit: int = 20) -> str:
     return "\n\n".join(parts)
 
 
-def fmt_floor_detail(data: Any) -> str:
+def fmt_floor_detail(data: Any, me: str = "") -> str:
     if not isinstance(data, dict):
         return compact_json(data)
     floor = data.get("floor") if isinstance(data.get("floor"), dict) else data
@@ -278,7 +364,10 @@ def fmt_floor_detail(data: Any) -> str:
         f"所属主题：{pick(floor, 'thread_id', 'thread', default='?')}"
         f" | 吧：{pick(floor, 'bar', 'bar_slug', default='?')}"
     )
-    return context + "\n" + _fmt_floor(floor, body_limit=4000)
+    note = self_talk_note({}, [floor], me)
+    if note:
+        context += "\n" + note
+    return context + "\n" + _fmt_floor(floor, body_limit=4000, me=me)
 
 
 def fmt_notifications(data: Any, limit: int = 30) -> str:

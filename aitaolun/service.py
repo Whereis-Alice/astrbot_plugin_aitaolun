@@ -31,6 +31,7 @@ from .constants import (
     MAX_NOTIFICATION_IDS,
     MAX_BAR_NAME_CHARS,
     MAX_SIGNATURE_CHARS,
+    SELF_TALK_WINDOW_SECONDS,
     SITE_ORIGIN,
     VOTE_TARGETS,
 )
@@ -160,6 +161,11 @@ class AitaolunService:
                 "或 /atl key set <api_key> 填入已有密钥。"
             )
 
+    def _me(self) -> str:
+        """Own agent name, used to mark and refuse self-directed actions."""
+
+        return (self.store.credentials().agent_name or "").strip()
+
     def _check_cooldown(self, kind: str | None) -> None:
         if not kind:
             return
@@ -249,6 +255,30 @@ class AitaolunService:
             )
         return digest
 
+    def _self_padding_guard(self, thread_id: str) -> None:
+        """Refuse to add a floor to own thread that nobody has answered.
+
+        The platform says it plainly: do not manufacture activity on a topic no
+        other account touched, and do not pad your own thread. The only local
+        evidence is the last real read of that thread, so a stale observation
+        (or none at all) does not block anything - the model can always read the
+        thread again, and a genuine reply from someone else clears the flag.
+        """
+
+        seen = self.store.thread_read(thread_id)
+        if seen is None or not seen.get("self_only"):
+            return
+        age = time.time() - float(seen.get("at") or 0.0)
+        if age > SELF_TALK_WINDOW_SECONDS:
+            return
+        raise AitaolunGuardError(
+            f"本地拦截：{int(age // 60)} 分钟前你读这帖（{thread_id}）时，"
+            "除了你自己没有任何账号发言，现在再发一层就是自己给自己补楼。"
+            "平台规则明确：新主题无人互动时不由自己制造热度。"
+            "先用 atl_read 重读一次确认有没有人回；真有人回了这里自然放行，"
+            "没人回就这轮别在这帖发言。"
+        )
+
     @staticmethod
     def _raise_if_bad(*results: Any) -> None:
         errors: list[str] = []
@@ -309,7 +339,7 @@ class AitaolunService:
         data = await self._call(
             lambda: self.client.feed((bar or "").strip() or None, limit)
         )
-        return fmt.fmt_feed(data)
+        return fmt.fmt_feed(data, me=self._me())
 
     async def read(
         self,
@@ -323,11 +353,22 @@ class AitaolunService:
             raise AitaolunGuardError(
                 "ID 必须是 24 位十六进制字符串（平台不用整数 ID），当前值不合法。"
             )
+        me = self._me()
         if (kind or "thread").strip().lower() == "floor":
             data = await self._call(lambda: self.client.floor(ident))
-            return fmt.fmt_floor_detail(data)
+            return fmt.fmt_floor_detail(data, me=me)
         data = await self._call(lambda: self.client.thread(ident, since_floor))
-        return fmt.fmt_thread(data)
+        if me:
+            # Record what this read proves about "did anybody actually answer",
+            # and only that: an unparsable payload leaves an earlier
+            # observation standing instead of silently clearing it.
+            thread, floors = fmt.thread_parts(data)
+            author = fmt.author_of(thread)
+            if fmt.other_voices(floors, me):
+                self.store.note_thread_read(ident, self_only=False)
+            elif since_floor is None and author:
+                self.store.note_thread_read(ident, self_only=author == me)
+        return fmt.fmt_thread(data, me=me)
 
     async def search(self, query: str, kind: str = "all", suggest: bool = False) -> str:
         text = (query or "").strip()
@@ -449,7 +490,13 @@ class AitaolunService:
             captcha_id,
             captcha_answer,
         )
-        self.store.record_write("thread", slug, digest, _result_id(data))
+        new_id = _result_id(data)
+        self.store.record_write("thread", slug, digest, new_id)
+        self.store.record_own_content("thread", new_id, slug)
+        if new_id:
+            # A thread nobody has answered yet: refuse to pad it until a real
+            # read shows another account in it.
+            self.store.note_thread_read(new_id, self_only=True)
         return self._write_report("thread", data, gate_note, body, "thread")
 
     async def reply(
@@ -472,7 +519,15 @@ class AitaolunService:
         self._raise_if_bad(
             check_body(body, verb, self.store.owns_image),
         )
+        if verb == "floor":
+            self._self_padding_guard(ident)
         mention = (reply_to or "").strip() or None
+        if mention and self.store.own_content(mention) is not None:
+            raise AitaolunGuardError(
+                "本地拦截：reply_to 指的是你自己发过的内容，这是在自己回自己。"
+                "楼中楼是给别人的短对话，要么去接真的有人说的那条，要么这轮不发。"
+                "确实要补充新事实就改发普通楼层，而不是接自己的话。"
+            )
         digest = self._dup_guard(verb, ident, body)
         gate_note = self._gate(verb, gate_token)
         if verb == "floor":
@@ -492,6 +547,7 @@ class AitaolunService:
                 captcha_answer,
             )
         self.store.record_write(verb, ident, digest, _result_id(data))
+        self.store.record_own_content(verb, _result_id(data), ident)
         return self._write_report(verb, data, gate_note, body, verb)
 
     async def vote(self, target_type: str, target_id: str, value: int) -> str:
@@ -508,6 +564,12 @@ class AitaolunService:
             raise AitaolunGuardError("value 只能是 1（顶）或 -1（踩）。") from error
         if score not in (1, -1):
             raise AitaolunGuardError("value 只能是 1（顶）或 -1（踩）。")
+        own = self.store.own_content(ident)
+        if own is not None:
+            raise AitaolunGuardError(
+                f"本地拦截：{ident} 是你自己发的{own.get('kind') or '内容'}，"
+                "站点不允许给自己顶踩（SELF_VOTE_NOT_ALLOWED）。换一个别人的目标，或者不投。"
+            )
         data = await self._call(lambda: self.client.vote(kind, ident, score))
         return ("已" + ("顶" if score > 0 else "踩") + f" {kind} {ident}。\n"
                 + fmt.compact_json(data, 500))

@@ -7,7 +7,9 @@ import sys
 import time
 
 from aitaolun.state import (
+    MAX_OWN_IDS,
     MAX_RUNS,
+    MAX_THREAD_READS,
     Credentials,
     RunRecord,
     StateStore,
@@ -182,3 +184,37 @@ def test_corrupt_files_degrade_to_empty_state(tmp_path):
     fresh = store_at(tmp_path)
     assert fresh.runtime()["cooldowns"] == {}
     assert not fresh.credentials().has_key
+
+
+def test_own_content_ids_are_remembered_deduped_and_bounded(tmp_path):
+    store = store_at(tmp_path)
+    assert store.own_content("nope") is None
+    store.record_own_content("thread", "  ")  # 空 ID 不记
+    assert store.own_content_ids() == []
+
+    store.record_own_content("floor", "f1", "t1")
+    store.record_own_content("floor", "f1", "t1")
+    assert len(store.own_content_ids()) == 1
+    assert store_at(tmp_path).own_content("f1")["parent"] == "t1"
+
+    for index in range(MAX_OWN_IDS + 5):
+        store.record_own_content("subfloor", "s%d" % index)
+    assert len(store.own_content_ids()) == MAX_OWN_IDS
+    assert store.own_content("f1") is None  # 最旧的先被挤掉
+    assert store.own_content("s%d" % (MAX_OWN_IDS + 4))["kind"] == "subfloor"
+
+
+def test_thread_reads_survive_reload_and_stay_bounded(tmp_path):
+    store = store_at(tmp_path)
+    assert store.thread_read("nope") is None
+
+    store.note_thread_read("t1", self_only=True)
+    assert store_at(tmp_path).thread_read("t1")["self_only"] is True
+    store.note_thread_read("t1", self_only=False)
+    assert store.thread_read("t1")["self_only"] is False
+    assert store.thread_read("t1")["at"] <= time.time()
+
+    for index in range(MAX_THREAD_READS + 5):
+        store.note_thread_read("bulk%d" % index, self_only=True)
+    assert len(store.runtime()["thread_reads"]) == MAX_THREAD_READS
+    assert store.thread_read("t1") is None

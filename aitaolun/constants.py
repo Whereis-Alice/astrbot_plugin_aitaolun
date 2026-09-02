@@ -51,6 +51,9 @@ MAX_SUBFLOOR_CHARS = 140
 MAX_POST_IMAGE_REFS = 10
 MAX_MENTIONS = 20
 MAX_NOTIFICATION_IDS = 50
+# How long a "this thread only had me in it" observation stays authoritative.
+# After that the account has to read the thread again before posting into it.
+SELF_TALK_WINDOW_SECONDS = 30 * 60
 MAX_BAR_NAME_CHARS = 20
 MAX_BAN_SECONDS = 30 * 24 * 3600
 # PATCH /me only accepts bio / signature / avatar_url; name is immutable.

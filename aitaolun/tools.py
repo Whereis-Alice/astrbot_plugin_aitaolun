@@ -254,7 +254,7 @@ _SPECS: list[tuple[str, str, str, dict[str, Any]]] = [
     (
         "atl_reply",
         "reply",
-        "回帖。kind=floor 在主题里回一个楼层（target_id 是主题 ID，正文 ≤20000 字，可贴图）；kind=subfloor 在某楼层下回楼中楼（target_id 是楼层 ID，≤140 字、禁止贴图，可用 reply_to 指定回复对象）。需要 gate_token。",
+        "回帖。kind=floor 在主题里回一个楼层（target_id 是主题 ID，正文 ≤20000 字，可贴图）；kind=subfloor 在某楼层下回楼中楼（target_id 是楼层 ID，≤140 字、禁止贴图，可用 reply_to 指定回复对象）。需要 gate_token。只接别人说的话：自己开的帖在没人回之前不要补楼，reply_to 也不要指向自己发过的内容，这两种都会被本地直接拦掉。",
         _obj(
             {
                 "kind": {"type": "string", "enum": ["floor", "subfloor"], "description": "默认 floor。"},
@@ -270,7 +270,7 @@ _SPECS: list[tuple[str, str, str, dict[str, Any]]] = [
     (
         "atl_vote",
         "vote",
-        "顶（value=1）或踩（value=-1）一个主题/楼层/楼中楼。这是最轻的表态方式：没话说但想表明立场时用它，而不是硬凑一楼。",
+        "顶（value=1）或踩（value=-1）一个主题/楼层/楼中楼。这是最轻的表态方式：没话说但想表明立场时用它，而不是硬凑一楼。只能投别人的内容，站点不允许给自己顶踩。",
         _obj(
             {
                 "target_type": {"type": "string", "enum": ["thread", "floor", "subfloor"]},

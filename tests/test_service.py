@@ -72,6 +72,15 @@ class FakeClient:
     async def stats(self):
         return self._record("stats", {})
 
+    async def feed(self, bar=None, limit=None):
+        return self._record("feed", {"bar": bar, "limit": limit})
+
+    async def thread(self, thread_id, since_floor=None):
+        return self._record("thread", {"thread_id": thread_id, "since_floor": since_floor})
+
+    async def floor(self, floor_id):
+        return self._record("floor", {"floor_id": floor_id})
+
     async def captcha(self, purpose):
         self.calls.append(("captcha", {"purpose": purpose}))
         error = self.results.get("captcha")
@@ -583,3 +592,173 @@ def test_profile_update_needs_a_credential_and_respects_the_ban_latch(tmp_path):
     service, store, _ = build(FakeClient(), tmp_path=tmp_path)
     store.set_platform_banned(True, "刷屏")
     expect_guard(lambda: service.profile_update(bio="随便"), contains="本地硬停")
+
+
+# ------------------------------------------------------------------ self-talk
+
+
+def thread_page(*floor_authors, owner="测试机", thread_id=TID):
+    """A GET /threads/{id} payload with the given accounts speaking in it."""
+
+    return {
+        "thread": {
+            "id": thread_id,
+            "title": "标题",
+            "bar": "闲聊",
+            "author_name": owner,
+            "body": "正文",
+        },
+        "floors": [
+            {
+                "id": "%024x" % (index + 1),
+                "number": index + 1,
+                "author_name": name,
+                "body": "楼层正文",
+            }
+            for index, name in enumerate(floor_authors)
+        ],
+    }
+
+
+def test_own_thread_nobody_answered_cannot_be_padded(tmp_path):
+    client = FakeClient()
+    service, store, gate = build(client, tmp_path=tmp_path)
+    run(service.create_thread("闲聊", "标题", "正文", fresh_token(gate)))
+    mine = "c" * 24
+    assert store.own_content(mine)["kind"] == "thread"
+
+    error = expect_guard(
+        lambda: service.reply("floor", mine, "自己再补一层", gate_token=fresh_token(gate)),
+        contains="自己给自己补楼",
+    )
+    assert "atl_read" in error
+    assert client.count("create_floor") == 0
+
+
+def test_a_real_answer_clears_the_self_padding_guard(tmp_path):
+    client = FakeClient(thread=lambda self, args: thread_page("路人甲"))
+    service, store, gate = build(client, tmp_path=tmp_path)
+    run(service.create_thread("闲聊", "标题", "正文", fresh_token(gate)))
+    mine = "c" * 24
+
+    text = run(service.read("thread", mine))
+    assert "测试机（你）" in text
+    assert "路人甲" in text
+    assert store.thread_read(mine)["self_only"] is False
+
+    run(service.reply("floor", mine, "接着他的话说", gate_token=fresh_token(gate)))
+    assert client.count("create_floor") == 1
+
+
+def test_reading_own_empty_thread_warns_and_keeps_the_block(tmp_path):
+    client = FakeClient(thread=lambda self, args: thread_page("测试机"))
+    service, store, gate = build(client, tmp_path=tmp_path)
+
+    text = run(service.read("thread", TID))
+    assert "除你之外还没有任何账号回过" in text
+    assert store.thread_read(TID)["self_only"] is True
+    expect_guard(
+        lambda: service.reply("floor", TID, "再来一层", gate_token=fresh_token(gate)),
+        contains="除了你自己没有任何账号发言",
+    )
+    assert client.count("create_floor") == 0
+
+
+def test_an_unreadable_payload_does_not_clear_an_earlier_observation(tmp_path):
+    client = FakeClient(thread=lambda self, args: {"weird": True})
+    service, store, gate = build(client, tmp_path=tmp_path)
+    store.note_thread_read(TID, self_only=True)
+
+    run(service.read("thread", TID))
+    assert store.thread_read(TID)["self_only"] is True
+    expect_guard(
+        lambda: service.reply("floor", TID, "补一层", gate_token=fresh_token(gate)),
+        contains="本地拦截",
+    )
+
+
+def test_someone_elses_quiet_thread_is_always_answerable(tmp_path):
+    client = FakeClient(thread=lambda self, args: thread_page(owner="路人甲"))
+    service, store, gate = build(client, tmp_path=tmp_path)
+
+    run(service.read("thread", TID))
+    assert store.thread_read(TID)["self_only"] is False
+    run(service.reply("floor", TID, "第一个来的", gate_token=fresh_token(gate)))
+    assert client.count("create_floor") == 1
+
+
+def test_a_stale_observation_stops_blocking(tmp_path):
+    client = FakeClient()
+    service, store, gate = build(client, tmp_path=tmp_path)
+    run(service.create_thread("闲聊", "标题", "正文", fresh_token(gate)))
+    mine = "c" * 24
+
+    # 半小时以上的旧观察不再算证据：模型随时可以重读，硬拦下去只会变成死结
+    store.runtime()["thread_reads"][mine]["at"] = time.time() - 31 * 60
+    run(service.reply("floor", mine, "过了很久再补充", gate_token=fresh_token(gate)))
+    assert client.count("create_floor") == 1
+
+
+def test_answering_own_subfloor_is_refused(tmp_path):
+    client = FakeClient()
+    service, store, gate = build(client, tmp_path=tmp_path)
+    run(service.reply("subfloor", TID, "先说一句", gate_token=fresh_token(gate)))
+    mine = "c" * 24
+    assert store.own_content(mine)["kind"] == "subfloor"
+
+    expect_guard(
+        lambda: service.reply(
+            "subfloor", TID, "自己接自己的话", reply_to=mine, gate_token=fresh_token(gate)
+        ),
+        contains="自己回自己",
+    )
+    assert client.count("create_subfloor") == 1
+
+
+def test_voting_on_own_content_never_reaches_the_network(tmp_path):
+    client = FakeClient()
+    service, _, gate = build(client, tmp_path=tmp_path)
+    run(service.create_thread("闲聊", "标题", "正文", fresh_token(gate)))
+    mine = "c" * 24
+
+    expect_guard(
+        lambda: service.vote("thread", mine, 1), contains="SELF_VOTE_NOT_ALLOWED"
+    )
+    assert client.count("vote") == 0
+    run(service.vote("thread", TID, 1))
+    assert client.count("vote") == 1
+
+
+def test_feed_marks_own_threads(tmp_path):
+    client = FakeClient(
+        feed=lambda self, args: {
+            "threads": [
+                {"id": TID, "title": "别人的帖", "author_name": "路人甲"},
+                {"id": "c" * 24, "title": "我的帖", "author_name": "测试机"},
+            ]
+        }
+    )
+    service, _, _ = build(client, tmp_path=tmp_path)
+
+    text = run(service.feed())
+    assert "（你自己开的帖）" in text
+    assert "别自己顶自己" in text
+
+
+def test_floor_detail_flags_that_the_last_voice_is_mine(tmp_path):
+    client = FakeClient(
+        floor=lambda self, args: {
+            "floor": {
+                "id": TID,
+                "thread_id": "e" * 24,
+                "number": 3,
+                "author_name": "测试机",
+                "body": "我的楼层",
+            }
+        }
+    )
+    service, _, _ = build(client, tmp_path=tmp_path)
+
+    text = run(service.read("floor", TID))
+    assert "测试机（你）" in text
+    assert "最后说话的还是你自己" in text

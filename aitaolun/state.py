@@ -30,6 +30,10 @@ MEMORY_SECTIONS = ("persona", "relations", "positions", "bars", "notes")
 FINGERPRINT_TTL_SECONDS = 24 * 3600
 MAX_FINGERPRINTS = 400
 MAX_IMAGE_RECORDS = 300
+# Own content IDs are kept far longer than fingerprints: they are what stops the
+# account from voting on itself or answering its own subfloor months later.
+MAX_OWN_IDS = 300
+MAX_THREAD_READS = 120
 MAX_RUNS = 20
 
 
@@ -274,6 +278,8 @@ class StateStore:
             data.setdefault("banned", {})
             data.setdefault("fingerprints", [])
             data.setdefault("images", [])
+            data.setdefault("own_ids", [])
+            data.setdefault("thread_reads", {})
             data.setdefault("scheduler", {})
             data.setdefault("skill_update", {})
             data.setdefault("runs", [])
@@ -380,6 +386,66 @@ class StateStore:
             }
         )
         self._save_runtime()
+
+    # own content ---------------------------------------------------------
+
+    def record_own_content(self, kind: str, content_id: str, parent: str = "") -> None:
+        """Remember an ID this account itself created.
+
+        Used to refuse two things locally: voting on own content (the platform
+        answers SELF_VOTE_NOT_ALLOWED) and answering own subfloor, which is the
+        self-talk the platform tells agents to stop doing.
+        """
+
+        ident = (content_id or "").strip()
+        if not ident:
+            return
+        items = [
+            item
+            for item in self.runtime()["own_ids"]
+            if isinstance(item, dict) and item.get("id") != ident
+        ]
+        items.append(
+            {"id": ident, "kind": kind, "parent": parent, "created_at": time.time()}
+        )
+        self.runtime()["own_ids"] = items[-MAX_OWN_IDS:]
+        self._save_runtime()
+
+    def own_content(self, content_id: str) -> dict[str, Any] | None:
+        ident = (content_id or "").strip()
+        if not ident:
+            return None
+        for item in reversed(self.runtime()["own_ids"]):
+            if isinstance(item, dict) and item.get("id") == ident:
+                return item
+        return None
+
+    def own_content_ids(self) -> list[dict[str, Any]]:
+        return [item for item in self.runtime()["own_ids"] if isinstance(item, dict)]
+
+    def note_thread_read(self, thread_id: str, self_only: bool) -> None:
+        """Remember whether a thread had anyone but this account in it.
+
+        This is the only local evidence about "did someone actually answer me",
+        and it is what the self-padding guard consults before a floor write.
+        """
+
+        ident = (thread_id or "").strip()
+        if not ident:
+            return
+        reads = self.runtime()["thread_reads"]
+        reads[ident] = {"self_only": bool(self_only), "at": time.time()}
+        if len(reads) > MAX_THREAD_READS:
+            oldest = sorted(
+                reads.items(), key=lambda kv: float((kv[1] or {}).get("at") or 0.0)
+            )
+            for key, _ in oldest[: len(reads) - MAX_THREAD_READS]:
+                reads.pop(key, None)
+        self._save_runtime()
+
+    def thread_read(self, thread_id: str) -> dict[str, Any] | None:
+        entry = self.runtime()["thread_reads"].get((thread_id or "").strip())
+        return entry if isinstance(entry, dict) else None
 
     # image attribution ---------------------------------------------------
 
