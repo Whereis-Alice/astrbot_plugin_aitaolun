@@ -153,13 +153,19 @@ class FakeClient:
         return sum(1 for item in self.calls if item[0] == name)
 
 
-def build(client, *, enforce=True, with_key=True, tmp_path=None):
+def build(client, *, enforce=True, with_key=True, tmp_path=None, options=None):
     store = StateStore(data_dir=tmp_path)
     if with_key:
         store.set_api_key("atl_" + "k" * 40, "测试机")
     docs = FakeDocs()
     gate = PostingGate(docs=docs, enforce=enforce)
-    service = AitaolunService(client=client, store=store, gate=gate, docs=docs)
+    service = AitaolunService(
+        client=client,
+        store=store,
+        gate=gate,
+        docs=docs,
+        options=dict(options or {}),
+    )
     return service, store, gate
 
 
@@ -713,6 +719,99 @@ def test_answering_own_subfloor_is_refused(tmp_path):
         contains="自己回自己",
     )
     assert client.count("create_subfloor") == 1
+
+
+def test_a_subfloor_under_own_floor_answering_nobody_is_refused(tmp_path):
+    client = FakeClient()
+    service, store, gate = build(client, tmp_path=tmp_path)
+    run(service.reply("floor", TID, "我自己的楼层", gate_token=fresh_token(gate)))
+    mine = "c" * 24
+    assert store.own_content(mine)["kind"] == "floor"
+
+    # 挂在自己楼层下、又谁都不接：这就是在自己楼下自言自语
+    expect_guard(
+        lambda: service.reply(
+            "subfloor", mine, "自己在自己楼下补一句", gate_token=fresh_token(gate)
+        ),
+        contains="自言自语",
+    )
+    assert client.count("create_subfloor") == 0
+
+
+def test_answering_a_real_person_under_own_floor_stays_allowed(tmp_path):
+    client = FakeClient()
+    service, store, gate = build(client, tmp_path=tmp_path)
+    run(service.reply("floor", TID, "我自己的楼层", gate_token=fresh_token(gate)))
+    mine = "c" * 24
+    someone = "d" * 24
+
+    run(
+        service.reply(
+            "subfloor",
+            mine,
+            "接你这句",
+            reply_to=someone,
+            gate_token=fresh_token(gate),
+        )
+    )
+    assert client.count("create_subfloor") == 1
+    assert client.calls[-1][1]["reply_to"] == someone
+
+
+def test_endless_back_and_forth_in_one_place_is_capped(tmp_path):
+    client = FakeClient()
+    service, store, gate = build(client, tmp_path=tmp_path, options={"same_target_write_limit": 2})
+
+    run(service.reply("floor", TID, "第一次接他", gate_token=fresh_token(gate)))
+    run(service.reply("floor", TID, "第二次接他", gate_token=fresh_token(gate)))
+    error = expect_guard(
+        lambda: service.reply("floor", TID, "第三次接他", gate_token=fresh_token(gate)),
+        contains="到上限了",
+    )
+    assert "换个帖" in error
+    assert client.count("create_floor") == 2
+
+    # 上限是按目标算的，别的帖子照常能发
+    run(service.reply("floor", "e" * 24, "另一个帖", gate_token=fresh_token(gate)))
+    assert client.count("create_floor") == 3
+
+
+def test_the_same_target_cap_counts_subfloors_by_their_floor(tmp_path):
+    client = FakeClient()
+    service, store, gate = build(client, tmp_path=tmp_path, options={"same_target_write_limit": 1})
+
+    run(service.reply("subfloor", TID, "一句", gate_token=fresh_token(gate)))
+    expect_guard(
+        lambda: service.reply("subfloor", TID, "又一句", gate_token=fresh_token(gate)),
+        contains="楼层",
+    )
+    # 同一个 ID 换成普通楼层是另一条通道，不共用计数
+    run(service.reply("floor", TID, "改发普通楼层", gate_token=fresh_token(gate)))
+    assert client.count("create_floor") == 1
+
+
+def test_the_same_target_cap_rolls_over(tmp_path):
+    client = FakeClient()
+    service, store, gate = build(client, tmp_path=tmp_path, options={"same_target_write_limit": 1})
+    run(service.reply("floor", TID, "很久以前那次", gate_token=fresh_token(gate)))
+
+    store.runtime()["target_writes"]["floor:" + TID] = [time.time() - 25 * 3600]
+    run(service.reply("floor", TID, "一天后再回来", gate_token=fresh_token(gate)))
+    assert client.count("create_floor") == 2
+
+
+def test_the_same_target_cap_can_be_switched_off(tmp_path):
+    client = FakeClient()
+    service, _, gate = build(client, tmp_path=tmp_path, options={"same_target_write_limit": 0})
+    for index in range(5):
+        run(service.reply("floor", TID, "第 %d 次" % index, gate_token=fresh_token(gate)))
+    assert client.count("create_floor") == 5
+
+
+def test_a_broken_same_target_limit_falls_back_to_the_default(tmp_path):
+    client = FakeClient()
+    service, _, _ = build(client, tmp_path=tmp_path, options={"same_target_write_limit": "很多"})
+    assert service._same_target_limit() == 3
 
 
 def test_voting_on_own_content_never_reaches_the_network(tmp_path):

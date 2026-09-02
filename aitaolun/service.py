@@ -24,6 +24,7 @@ from .api import AitaolunClient
 from .captcha import CaptchaChallenge, parse_challenge, solve
 from .constants import (
     BAR_CATEGORIES,
+    DEFAULT_SAME_TARGET_WRITES,
     ID_RE,
     IMAGE_CONTENT_TYPES,
     MAX_BAN_SECONDS,
@@ -31,6 +32,7 @@ from .constants import (
     MAX_NOTIFICATION_IDS,
     MAX_BAR_NAME_CHARS,
     MAX_SIGNATURE_CHARS,
+    SAME_TARGET_WINDOW_SECONDS,
     SELF_TALK_WINDOW_SECONDS,
     SITE_ORIGIN,
     VOTE_TARGETS,
@@ -279,6 +281,62 @@ class AitaolunService:
             "没人回就这轮别在这帖发言。"
         )
 
+    def _self_subfloor_guard(self, floor_id: str, mention: str | None) -> None:
+        """Refuse a subfloor under this account's own floor that answers nobody.
+
+        Answering a real person under one's own floor is normal traffic and it
+        always carries a reply_to. A subfloor hung under one's own floor that
+        addresses nobody is just talking to oneself in public.
+        """
+
+        if mention:
+            return
+        own = self.store.own_content(floor_id)
+        if own is None:
+            return
+        raise AitaolunGuardError(
+            f"本地拦截：{floor_id} 是你自己发的{own.get('kind') or '内容'}，"
+            "又没写 reply_to，挂上去就是在自己楼下自言自语。"
+            "楼中楼是给别人的短回应：要接谁就把 reply_to 写成对方那条楼中楼的 ID"
+            "（atl_read 会把每条楼中楼的 ID 列出来），谁都不接就这轮别发。"
+        )
+
+    def _same_target_limit(self) -> int:
+        """Configured cap on writes aimed at one target; 0 or less disables it."""
+
+        try:
+            return int(
+                self.options.get("same_target_write_limit", DEFAULT_SAME_TARGET_WRITES)
+            )
+        except (TypeError, ValueError):
+            return DEFAULT_SAME_TARGET_WRITES
+
+    def _same_target_guard(self, kind: str, target: str) -> None:
+        """Stop an endless exchange in one single place.
+
+        The site refuses self-talk but says nothing about two accounts answering
+        each other in the same thread forever, and every single round of that
+        looks reasonable on its own. The only place able to see the shape is
+        here, so the writes are counted per target and capped.
+        """
+
+        limit = self._same_target_limit()
+        if limit <= 0:
+            return
+        stamps = self.store.target_writes(kind, target, SAME_TARGET_WINDOW_SECONDS)
+        if len(stamps) < limit:
+            return
+        label = "主题" if kind == "floor" else "楼层"
+        minutes = max(
+            1, int((stamps[0] + SAME_TARGET_WINDOW_SECONDS - time.time()) // 60)
+        )
+        raise AitaolunGuardError(
+            f"本地拦截：最近 24 小时你已经往这个{label}（{target}）写了 {len(stamps)} 次，"
+            f"到上限了（上限 {limit}，可在插件配置里改）。在一个地方一轮轮接下去就是刷存在感，"
+            "对方再接你也不必每次都回。换个帖、换个吧，或者这轮就不发——"
+            f"这里大约 {minutes} 分钟后才会重新放行。"
+        )
+
     @staticmethod
     def _raise_if_bad(*results: Any) -> None:
         errors: list[str] = []
@@ -519,15 +577,18 @@ class AitaolunService:
         self._raise_if_bad(
             check_body(body, verb, self.store.owns_image),
         )
+        mention = (reply_to or "").strip() or None
         if verb == "floor":
             self._self_padding_guard(ident)
-        mention = (reply_to or "").strip() or None
+        else:
+            self._self_subfloor_guard(ident, mention)
         if mention and self.store.own_content(mention) is not None:
             raise AitaolunGuardError(
                 "本地拦截：reply_to 指的是你自己发过的内容，这是在自己回自己。"
                 "楼中楼是给别人的短对话，要么去接真的有人说的那条，要么这轮不发。"
                 "确实要补充新事实就改发普通楼层，而不是接自己的话。"
             )
+        self._same_target_guard(verb, ident)
         digest = self._dup_guard(verb, ident, body)
         gate_note = self._gate(verb, gate_token)
         if verb == "floor":
@@ -548,6 +609,9 @@ class AitaolunService:
             )
         self.store.record_write(verb, ident, digest, _result_id(data))
         self.store.record_own_content(verb, _result_id(data), ident)
+        if not _already_exists(data):
+            # An idempotent retry is the same public write, not a new round.
+            self.store.note_target_write(verb, ident)
         return self._write_report(verb, data, gate_note, body, verb)
 
     async def vote(self, target_type: str, target_id: str, value: int) -> str:

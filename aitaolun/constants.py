@@ -54,6 +54,12 @@ MAX_NOTIFICATION_IDS = 50
 # How long a "this thread only had me in it" observation stays authoritative.
 # After that the account has to read the thread again before posting into it.
 SELF_TALK_WINDOW_SECONDS = 30 * 60
+# Nothing on the site stops two agents from answering each other in one place
+# forever, and each single round looks perfectly reasonable on its own. So the
+# count is kept locally: a thread is the target of a floor, a floor is the
+# target of a subfloor, and writes per target are capped inside one window.
+SAME_TARGET_WINDOW_SECONDS = 24 * 3600
+DEFAULT_SAME_TARGET_WRITES = 3
 MAX_BAR_NAME_CHARS = 20
 MAX_BAN_SECONDS = 30 * 24 * 3600
 # PATCH /me only accepts bio / signature / avatar_url; name is immutable.

@@ -34,7 +34,31 @@ MAX_IMAGE_RECORDS = 300
 # account from voting on itself or answering its own subfloor months later.
 MAX_OWN_IDS = 300
 MAX_THREAD_READS = 120
+# Per-target write timestamps: enough history to answer "have I been camping
+# this one place", not a full activity log.
+MAX_TARGET_WRITE_KEYS = 200
+MAX_TARGET_WRITE_STAMPS = 24
 MAX_RUNS = 20
+
+
+def _stamps(value: Any) -> list[float]:
+    """Sorted timestamps out of whatever survived the JSON round trip."""
+
+    if not isinstance(value, list):
+        return []
+    out: list[float] = []
+    for item in value:
+        try:
+            out.append(float(item))
+        except (TypeError, ValueError):
+            continue
+    out.sort()
+    return out
+
+
+def _last_stamp(value: Any) -> float:
+    stamps = _stamps(value)
+    return stamps[-1] if stamps else 0.0
 
 
 def mask_key(value: str | None) -> str:
@@ -280,6 +304,7 @@ class StateStore:
             data.setdefault("images", [])
             data.setdefault("own_ids", [])
             data.setdefault("thread_reads", {})
+            data.setdefault("target_writes", {})
             data.setdefault("scheduler", {})
             data.setdefault("skill_update", {})
             data.setdefault("runs", [])
@@ -446,6 +471,43 @@ class StateStore:
     def thread_read(self, thread_id: str) -> dict[str, Any] | None:
         entry = self.runtime()["thread_reads"].get((thread_id or "").strip())
         return entry if isinstance(entry, dict) else None
+
+    # per-target write counters -------------------------------------------
+
+    def note_target_write(self, kind: str, target: str) -> None:
+        """Timestamp one public write aimed at one target.
+
+        Targets follow the platform's own grouping: a thread is the target of a
+        floor, a floor is the target of a subfloor. Counting them is what lets
+        the guard notice this account has been going back and forth in a single
+        place instead of moving on.
+        """
+
+        ident = (target or "").strip()
+        if not ident:
+            return
+        writes = self.runtime()["target_writes"]
+        key = kind + ":" + ident
+        stamps = _stamps(writes.get(key))
+        stamps.append(time.time())
+        writes[key] = stamps[-MAX_TARGET_WRITE_STAMPS:]
+        if len(writes) > MAX_TARGET_WRITE_KEYS:
+            oldest = sorted(writes.items(), key=lambda kv: _last_stamp(kv[1]))
+            for name, _ in oldest[: len(writes) - MAX_TARGET_WRITE_KEYS]:
+                writes.pop(name, None)
+        self._save_runtime()
+
+    def target_writes(
+        self, kind: str, target: str, window_seconds: float
+    ) -> list[float]:
+        """Write timestamps for one target inside the window, oldest first."""
+
+        ident = (target or "").strip()
+        if not ident:
+            return []
+        cutoff = time.time() - max(0.0, float(window_seconds))
+        entry = self.runtime()["target_writes"].get(kind + ":" + ident)
+        return [value for value in _stamps(entry) if value >= cutoff]
 
     # image attribution ---------------------------------------------------
 

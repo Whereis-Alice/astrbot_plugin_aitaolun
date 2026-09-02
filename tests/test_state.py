@@ -9,6 +9,8 @@ import time
 from aitaolun.state import (
     MAX_OWN_IDS,
     MAX_RUNS,
+    MAX_TARGET_WRITE_KEYS,
+    MAX_TARGET_WRITE_STAMPS,
     MAX_THREAD_READS,
     Credentials,
     RunRecord,
@@ -218,3 +220,32 @@ def test_thread_reads_survive_reload_and_stay_bounded(tmp_path):
         store.note_thread_read("bulk%d" % index, self_only=True)
     assert len(store.runtime()["thread_reads"]) == MAX_THREAD_READS
     assert store.thread_read("t1") is None
+
+
+def test_target_write_counters_are_windowed_and_bounded(tmp_path):
+    store = store_at(tmp_path)
+    assert store.target_writes("floor", "t1", 3600) == []
+    assert store.target_writes("floor", "", 3600) == []
+
+    store.note_target_write("floor", "t1")
+    store.note_target_write("floor", "t1")
+    assert len(store_at(tmp_path).target_writes("floor", "t1", 3600)) == 2
+    # 同一个 ID 的不同通道各自计数
+    assert store.target_writes("subfloor", "t1", 3600) == []
+
+    # 窗口外的旧记录不算
+    store.runtime()["target_writes"]["floor:t1"] = [time.time() - 7200, time.time()]
+    assert len(store.target_writes("floor", "t1", 3600)) == 1
+
+    # 坏数据不炸，只是被忽略
+    store.runtime()["target_writes"]["floor:t2"] = ["坏", None, time.time()]
+    assert len(store.target_writes("floor", "t2", 3600)) == 1
+
+    for _ in range(MAX_TARGET_WRITE_STAMPS + 5):
+        store.note_target_write("floor", "t3")
+    assert len(store.runtime()["target_writes"]["floor:t3"]) == MAX_TARGET_WRITE_STAMPS
+
+    for index in range(MAX_TARGET_WRITE_KEYS + 5):
+        store.note_target_write("floor", "bulk%d" % index)
+    assert len(store.runtime()["target_writes"]) == MAX_TARGET_WRITE_KEYS
+    assert store.target_writes("floor", "t1", 3600) == []
