@@ -600,14 +600,196 @@ def test_wake_records_injection_failures(tmp_path, monkeypatch):
     assert plugin.store.runs(1)[0].status == "inject_failed"
 
 
+# --------------------------------------------------------- future-task waking
+
+
+class FakeCronManager:
+    """假的 context.cron_manager：只记参数，字段名和真的一致。"""
+
+    def __init__(self, jobs=None, boom=False):
+        self.calls = []
+        self.deleted = []
+        self.jobs = list(jobs or [])
+        self.boom = boom
+        self._started = True
+
+    async def add_active_job(self, **kwargs):
+        if self.boom:
+            raise RuntimeError("数据库挂了")
+        self.calls.append(kwargs)
+        job = SimpleNamespace(job_id="job-%d" % (len(self.calls),), name=kwargs["name"])
+        self.jobs.append(job)
+        return job
+
+    async def list_jobs(self, job_type=None):
+        return list(self.jobs)
+
+    async def delete_job(self, job_id):
+        self.deleted.append(job_id)
+        self.jobs = [job for job in self.jobs if job.job_id != job_id]
+
+
+def with_cron(plugin, context, **kwargs):
+    manager = FakeCronManager(**kwargs)
+    context.cron_manager = manager
+    return manager
+
+
+def test_wake_arms_a_future_task_when_the_framework_supports_it(tmp_path, monkeypatch):
+    plugin, context = wired(tmp_path, monkeypatch, {"heartbeat_include_brief": False})
+    manager = with_cron(plugin, context)
+    dispatch(plugin, "bind")
+    box = captured_injection(plugin, monkeypatch)
+
+    run(plugin._wake("heartbeat", "该返场了"))
+
+    # 走的是框架的未来任务，一条合成消息都没伪造
+    assert box == {}
+    payload = manager.calls[0]["payload"]
+    assert payload["session"] == "aiocqhttp:FriendMessage:sess-1"
+    assert payload["note"] == "该返场了"
+    assert payload["sender_id"] == "owner-1"
+    assert manager.calls[0]["run_once"] is True
+
+    record = plugin.store.runs(1)[0]
+    assert record.status == "cron_armed" and "job-1" in record.detail
+    assert plugin.store.scheduler_state()["last_error"] == ""
+
+
+def test_wake_falls_back_to_injection_when_arming_fails(tmp_path, monkeypatch):
+    plugin, context = wired(tmp_path, monkeypatch, {"heartbeat_include_brief": False})
+    with_cron(plugin, context, boom=True)
+    dispatch(plugin, "bind")
+    box = captured_injection(plugin, monkeypatch)
+
+    run(plugin._wake("heartbeat", "该返场了"))
+
+    assert box["is_wake"] is True  # auto 模式：排不出去就退回注入
+    statuses = [item.status for item in plugin.store.runs(2)]  # 新的在前
+    assert statuses == ["injected", "cron_failed"]
+
+
+def test_wake_mode_cron_never_silently_falls_back(tmp_path, monkeypatch):
+    plugin, context = wired(
+        tmp_path,
+        monkeypatch,
+        {"heartbeat_include_brief": False, "heartbeat_wake_mode": "cron"},
+    )
+    dispatch(plugin, "bind")
+    box = captured_injection(plugin, monkeypatch)
+
+    # 没有 cron_manager：锁死 cron 就宁可不发，也不悄悄换成注入
+    run(plugin._wake("heartbeat", "该返场了"))
+    assert box == {}
+    assert plugin.store.runs(1)[0].status == "cron_unavailable"
+
+    with_cron(plugin, context, boom=True)
+    run(plugin._wake("heartbeat", "该返场了"))
+    assert box == {}
+    assert plugin.store.runs(1)[0].status == "cron_failed"
+
+
+def test_wake_mode_inject_ignores_the_scheduler(tmp_path, monkeypatch):
+    plugin, context = wired(
+        tmp_path,
+        monkeypatch,
+        {"heartbeat_include_brief": False, "heartbeat_wake_mode": "inject"},
+    )
+    manager = with_cron(plugin, context)
+    dispatch(plugin, "bind")
+    box = captured_injection(plugin, monkeypatch)
+
+    run(plugin._wake("heartbeat", "该返场了"))
+
+    assert manager.calls == []
+    assert box["message_str"] == "，该返场了"
+    assert plugin.store.runs(1)[0].status == "injected"
+
+
+def test_unknown_wake_mode_degrades_to_auto(tmp_path, monkeypatch):
+    plugin, context = wired(tmp_path, monkeypatch, {"heartbeat_wake_mode": "MAGIC"})
+    assert plugin._wake_mode() == "auto"
+    assert plugin._effective_wake_mode()[0] == "inject"
+    with_cron(plugin, context)
+    assert plugin._effective_wake_mode()[0] == "cron"
+
+
+def test_manual_trigger_reports_the_future_task(tmp_path, monkeypatch):
+    plugin, context = wired(
+        tmp_path, monkeypatch, {"heartbeat_include_brief": False, "heartbeat_enabled": True}
+    )
+    with_cron(plugin, context)
+    ready(plugin)
+    dispatch(plugin, "bind")
+
+    text = dispatch(plugin, "heartbeat")
+    assert "已排入 AstrBot 未来任务" in text
+    assert "send_message_to_user" in text
+    assert "未来任务" in dispatch(plugin, "bind")
+    assert "未来任务" in dispatch(plugin, "status")
+
+
+def test_diag_reports_the_future_task_route(tmp_path, monkeypatch):
+    plugin, context = wired(tmp_path, monkeypatch)
+    with_cron(plugin, context)
+    dispatch(plugin, "bind")
+
+    text = dispatch(plugin, "diag")
+    assert "AstrBot 未来任务：可用" in text
+    assert "调度器已启动" in text
+    assert "待触发任务：0 个" in text
+    # 走未来任务时唤醒判定完全无关，别再拿它误导人
+    assert "会被唤醒" not in text
+    assert "atl_*" in text
+
+
+def test_stale_future_tasks_are_purged_on_load_and_unload(tmp_path, monkeypatch):
+    plugin, context = make_plugin(tmp_path, monkeypatch)
+    leftovers = [
+        SimpleNamespace(job_id="dead-1", name="aitaolun_heartbeat"),
+        SimpleNamespace(job_id="keep", name="user_daily_report"),
+    ]
+    manager = with_cron(plugin, context, jobs=leftovers)
+
+    async def scenario():
+        await plugin.initialize()
+        assert manager.deleted == ["dead-1"]
+        await plugin.terminate()
+
+    run(scenario())
+    assert manager.deleted == ["dead-1"]  # 卸载时已经没有残留可删
+    assert [job.job_id for job in manager.jobs] == ["keep"]
+
+
+def test_purge_failures_never_block_startup(tmp_path, monkeypatch):
+    plugin, context = make_plugin(tmp_path, monkeypatch)
+
+    class BrokenManager(FakeCronManager):
+        async def list_jobs(self, job_type=None):
+            raise RuntimeError("库锁了")
+
+    context.cron_manager = BrokenManager()
+
+    async def scenario():
+        await plugin.initialize()
+        assert plugin.scheduler is not None and plugin.scheduler.running
+        await plugin.terminate()
+
+    run(scenario())
+
+
 def test_diag_explains_whether_the_injection_will_wake_the_bot(tmp_path, monkeypatch):
+    """没有 cron_manager 的老框架：诊断要讲清楚注入这条回退路能不能唤醒。"""
+
     plugin, _ = wired(tmp_path, monkeypatch)
     assert "先在你想让它说话的那个会话里执行 /atl bind" in dispatch(plugin, "diag")
 
     dispatch(plugin, "bind")
     text = dispatch(plugin, "diag")
-    assert "返场注入诊断" in text
+    assert "返场诊断" in text
     assert "aiocqhttp:FriendMessage:sess-1" in text
+    assert "已自动回退" in text  # 没有 cron_manager
+    assert "会话串能否解析：✅" in text
     assert "会被唤醒 ✅" in text
     assert "'，'" in text  # 自动读到的唤醒前缀
     assert "还没跑过" in text

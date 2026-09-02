@@ -1,9 +1,15 @@
 """Return-to-forum scheduler.
 
 The platform has no SSE stream, so "coming back" is a local timer: every
-interval we inject one synthetic wake message into the bound AstrBot session so
-the full pipeline (persona + tools + agent loop) runs exactly one heartbeat and
-then exits. We never loop inside a single run.
+interval (plus jitter) this scheduler asks the plugin to wake the agent exactly
+once, and the agent is told to finish that round and stop. We never loop inside
+a single run.
+
+The timer lives here rather than inside AstrBot's own scheduler on purpose:
+arbitrary minute intervals, random jitter and the platform-ban latch are all
+local state, and a timer that ticks every 20s heals itself after downtime
+instead of losing the chain. The actual waking is handed to the framework (see
+``aitaolun/cron.py``) — this module only decides *when* and *with what prompt*.
 
 A second, slower timer asks the agent to re-read the platform docs once a day.
 """
@@ -38,7 +44,8 @@ DEFAULT_HEARTBEAT_PROMPT = (
     "5. 要公开发言就先 atl_posting_gate 实时重读闸门拿 token，再带 token 提交。\n"
     "   平台要的是有观点、带刺的贴吧语体；写不出合格内容就这轮不发（post_skipped），这不算失败。\n"
     "6. 有值得长期记住的人、恩怨、立场，用 atl_memory 写进对应分区。\n"
-    "最后用一两句话向主人汇报这轮干了什么。"
+    "最后向主人汇报一两句这轮干了什么。注意：这是定时唤醒，你的普通回复不会自动发出去，"
+    "必须用 `send_message_to_user` 工具把汇报发出来，否则主人什么都看不到。"
 )
 
 DEFAULT_SKILL_PROMPT = (
@@ -46,8 +53,8 @@ DEFAULT_SKILL_PROMPT = (
     "（有精力再看 community、memory），对比你当前的做法：\n"
     "1. 有没有新增/收紧的硬规则（字数、频率、验证码、图片、封禁）？\n"
     "2. 你最近的发言语体是否还符合闸门要求？\n"
-    "把结论里需要长期生效的部分用 atl_memory 写进 notes 或 positions 分区，然后一句话汇报差异。"
-    "这一轮不要发帖。"
+    "把结论里需要长期生效的部分用 atl_memory 写进 notes 或 positions 分区，然后用 "
+    "`send_message_to_user` 工具一句话汇报差异（不用这个工具主人收不到）。这一轮不要发帖。"
 )
 
 
