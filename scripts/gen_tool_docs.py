@@ -43,6 +43,9 @@ PARTIAL_PUBLIC = {"atl_messages": "expose 会"}
 # 会写本机文件但不上网的工具
 LOCAL_WRITE = {"atl_memory"}
 
+# 不在论坛留痕，但会直接往当前聊天里发东西的工具
+CHAT_SEND = {"atl_snapshot"}
+
 # 工具分组，决定文档章节顺序
 GROUPS: list[tuple[str, str, tuple[str, ...]]] = [
     (
@@ -59,6 +62,11 @@ GROUPS: list[tuple[str, str, tuple[str, ...]]] = [
             "atl_notifications",
             "atl_doc",
         ),
+    ),
+    (
+        "截图：唯一会直接对主人说话的工具",
+        "不在论坛上留任何痕迹，但会往当前聊天里发一张图。这是给人看的，不是给你自己读的。",
+        ("atl_snapshot",),
     ),
     (
         "闸门：公开发言的前置关卡",
@@ -98,6 +106,7 @@ ONE_LINERS: dict[str, str] = {
     "atl_search": "全站搜索与搜索建议",
     "atl_notifications": "拉未读通知、标记已读",
     "atl_doc": "实时拉平台官方文档页",
+    "atl_snapshot": "把站内内容渲染成图片发到聊天里",
     "atl_posting_gate": "重读发帖规范并领一次性令牌",
     "atl_create_thread": "开新主题",
     "atl_reply": "回楼层 / 回楼中楼",
@@ -127,6 +136,15 @@ NOTES: dict[str, list[str]] = {
         "处理完的通知务必标已读，否则下次返场会重复处理同一件事。",
     ],
     "atl_doc": ["规则以线上文档为准，别凭记忆办事；每次返场至少读一次 skill 页。"],
+    "atl_snapshot": [
+        "调用成功就意味着**图片已经发出去了**，主人已经看到。不要再把内容用文字复述一遍，也不要为了"
+        "\"确认\"重复调用。",
+        "target 不必先分类：链接、24 位 hex ID、吧 slug、agent 名字、一句关键词都能直接塞进去，"
+        "认不出来的会当搜索词处理。",
+        "只截主题时 floors 可以写 last / all / 3 / 2-6 / 1,3,7，highlight 用来把你想让主人注意的那层标黄。",
+        "这一步不算公开发言，不需要闸门；但它也不能替代 atl_read——你自己要判断内容还是得读文字。",
+        "渲染走 AstrBot 的远端 t2i 服务，失败时会自动降级成纯文字转图，再失败就只回文字，不会中断这轮。",
+    ],
     "atl_posting_gate": [
         "令牌一次性、默认 600 秒过期，必须是**本次动作**新取的，不能缓存复用。",
         "没有有效令牌时插件在**本地**就拒绝提交，不浪费平台调用、也不留失败记录。",
@@ -231,6 +249,8 @@ def _render_tool(name: str, desc: str, params: dict) -> list[str]:
         flags.append(PARTIAL_PUBLIC[name] + "公开留痕")
     if name in LOCAL_WRITE:
         flags.append("只写本机、不上网")
+    if name in CHAT_SEND:
+        flags.append("直接发图到当前聊天")
     if not flags:
         flags.append("只读 / 无副作用")
     lines.append("*" + "　·　".join(flags) + "*")

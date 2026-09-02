@@ -46,6 +46,7 @@ from .errors import (
     AitaolunGuardError,
 )
 from .gate import PostingGate
+from . import snapshot as snap
 from .guard import (
     check_body,
     check_image_path,
@@ -143,6 +144,10 @@ class AitaolunService:
     gate: PostingGate
     docs: DocFetcher
     options: dict[str, Any] = field(default_factory=dict)
+    # Injected by main.py after construction, because rendering needs the live
+    # Star instance's bound methods. Optional so the whole service stays usable
+    # (and testable) without any rendering backend at all.
+    renderer: snap.SnapshotRenderer | None = None
 
     # ------------------------------------------------------------------ guards
     def _ban_latch(self) -> None:
@@ -415,7 +420,19 @@ class AitaolunService:
         if (kind or "thread").strip().lower() == "floor":
             data = await self._call(lambda: self.client.floor(ident))
             return fmt.fmt_floor_detail(data, me=me)
+        data = await self._read_thread(ident, since_floor)
+        return fmt.fmt_thread(data, me=me)
+
+    async def _read_thread(self, ident: str, since_floor: int | None = None) -> Any:
+        """Fetch a thread and record what the read proves about self-talk.
+
+        Shared by the text reader and the screenshot path so that looking at a
+        thread updates the same evidence either way; otherwise taking a picture
+        of one's own dead thread would leave the padding guard blind.
+        """
+
         data = await self._call(lambda: self.client.thread(ident, since_floor))
+        me = self._me()
         if me:
             # Record what this read proves about "did anybody actually answer",
             # and only that: an unparsable payload leaves an earlier
@@ -426,7 +443,7 @@ class AitaolunService:
                 self.store.note_thread_read(ident, self_only=False)
             elif since_floor is None and author:
                 self.store.note_thread_read(ident, self_only=author == me)
-        return fmt.fmt_thread(data, me=me)
+        return data
 
     async def search(self, query: str, kind: str = "all", suggest: bool = False) -> str:
         text = (query or "").strip()
@@ -1182,6 +1199,179 @@ class AitaolunService:
             parts.append(f"身份：{creds.agent_name}")
         parts.append("认领：" + ("已认领" if creds.claimed else "未认领（claim_url 只出现一次）"))
         return " | ".join(parts)
+
+
+    # ---------------------------------------------------------------- snapshot
+    def _snapshot_int(self, key: str, fallback: int) -> int:
+        try:
+            return int(self.options.get(key, fallback))
+        except (TypeError, ValueError):
+            return fallback
+
+    def _snapshot_bool(self, key: str, fallback: bool) -> bool:
+        value = self.options.get(key, fallback)
+        if isinstance(value, str):
+            return value.strip().lower() not in ("", "0", "false", "no", "off", "否")
+        return bool(value)
+
+    async def snapshot(
+        self,
+        view: str = "auto",
+        target: str = "",
+        note: str = "",
+        floors: str = "",
+        highlight: str = "",
+        limit: int | None = None,
+    ) -> snap.SnapshotResult:
+        """Render one site view as an image the caller can send into the chat.
+
+        Reading the site already works fine as text for the model, but the human
+        owner reads a picture far faster than 60 lines of prose, and "去看看那个
+        帖子然后发给我" is a single sentence they will actually say. So the target
+        is parsed instead of classified: a URL, a bare id, a bar slug or a plain
+        question all land on some view rather than on an error.
+
+        Returns a result rather than a string because the caller has to send an
+        image; the text field is always filled so a render failure still answers.
+        """
+
+        if not self._snapshot_bool("snapshot_enabled", True):
+            raise AitaolunGuardError(
+                "截图功能被关掉了（插件配置 snapshot_enabled = false）。"
+                "要用就去 AstrBot 面板把它打开，或者改用 atl_read / atl_feed 读文字。"
+            )
+        if self.renderer is None:
+            raise AitaolunGuardError(
+                "本机没有初始化渲染后端，截图不可用。重载一次插件；"
+                "仍然不行就用 atl_read / atl_feed 读文字。"
+            )
+
+        wanted = (view or "auto").strip().lower()
+        raw_target = str(target or "").strip()
+        guessed, cleaned = snap.parse_target(raw_target)
+        if wanted in ("", "auto"):
+            wanted = guessed or ("feed" if not cleaned else "search")
+        elif guessed and wanted != guessed and wanted in ("thread", "feed", "profile"):
+            # An explicit view loses to a pasted URL only when the URL disagrees
+            # about something we can actually check: a /t/ link is never a feed.
+            wanted = guessed
+        if wanted not in snap.SNAPSHOT_VIEWS:
+            raise AitaolunGuardError(
+                "view 只能是：" + " / ".join(snap.SNAPSHOT_VIEWS[1:]) + "，或者不填让插件自己判断。"
+            )
+        cleaned = cleaned or raw_target
+
+        self._preflight()
+        cap = limit if limit is None else max(1, int(limit))
+        embed = self._snapshot_bool("snapshot_embed_images", True)
+        max_floors = self._snapshot_int("snapshot_max_floors", snap.DEFAULT_MAX_FLOORS)
+        me = self._me()
+
+        if wanted == "thread":
+            ident = cleaned.lower()
+            if not ID_RE.match(ident):
+                raise AitaolunGuardError(
+                    "要截主题图就得给我主题 ID（24 位 hex）或帖子链接，当前值不是："
+                    + fmt.truncate(cleaned, 60)
+                    + "。不知道 ID 就先 atl_feed / atl_search 找。"
+                )
+            data = await self._read_thread(ident)
+            thread, all_floors = fmt.thread_parts(data)
+            page = snap.build_thread_html(
+                data, me, floors, highlight, max_floors, embed
+            )
+            text = fmt.fmt_thread(data, me=me)
+            caption = self._snapshot_caption(
+                "主题《" + fmt.truncate(fmt.pick(thread, "title", default="无标题"), 40) + "》",
+                [
+                    str(fmt.pick(thread, "bar", "bar_slug", default="") or "") + " 吧",
+                    "共 " + str(fmt.pick(thread, "floor_count", "floors_count", default=len(all_floors))) + " 楼",
+                ],
+                SITE_ORIGIN + "/t/" + ident,
+                note,
+            )
+        elif wanted == "feed":
+            bar = cleaned.lstrip("/").strip()
+            data = await self._call(lambda: self.client.feed(bar or None, cap))
+            page = snap.build_feed_html(data, me, bar, cap or snap.DEFAULT_MAX_ITEMS, embed)
+            text = fmt.fmt_feed(data, me=me)
+            count = len(fmt.as_list(data, "threads", "feed", "items", "results"))
+            caption = self._snapshot_caption(
+                (bar + " 吧信息流") if bar else "全站信息流",
+                [str(count) + " 条"],
+                SITE_ORIGIN + ("/b/" + bar if bar else "/hot"),
+                note,
+            )
+        elif wanted == "profile":
+            name = cleaned
+            if name and name != me:
+                data = await self._call(lambda: self.client.agent(name))
+                text = fmt.fmt_agent(data)
+            else:
+                data = await self._call(self.client.me)
+                text = fmt.fmt_me(data)
+                name = me or name
+            page = snap.build_profile_html(data, embed)
+            caption = self._snapshot_caption(
+                (name or "本账号") + " 的档案",
+                [],
+                SITE_ORIGIN + "/u/" + name if name else "",
+                note,
+            )
+        elif wanted == "search":
+            query = cleaned
+            if not query:
+                raise AitaolunGuardError("搜索截图需要关键词。")
+            data = await self._call(lambda: self.client.search(query, "all"))
+            page = snap.build_search_html(data, query, cap or snap.DEFAULT_MAX_ITEMS)
+            text = fmt.fmt_search(data)
+            caption = self._snapshot_caption(
+                "搜索「" + fmt.truncate(query, 30) + "」",
+                [],
+                "",
+                note,
+            )
+        else:
+            data = await self._call(lambda: self.client.notifications(True, None))
+            page = snap.build_notifications_html(data, cap or snap.DEFAULT_MAX_ITEMS)
+            text = fmt.fmt_notifications(data)
+            count = len(fmt.as_list(data, "notifications", "items", "results"))
+            caption = self._snapshot_caption(
+                "未读通知", [str(count) + " 条"], "", note
+            )
+
+        image_path, engine, render_note = await self.renderer.render(page, text)
+        self.record_run(
+            "snapshot",
+            "ok" if image_path else "render_failed",
+            wanted + " " + fmt.truncate(cleaned, 60) + " " + engine,
+        )
+        return snap.SnapshotResult(
+            view=wanted,
+            image_path=image_path,
+            caption=caption,
+            text=text,
+            engine=engine,
+            note=render_note,
+        )
+
+    @staticmethod
+    def _snapshot_caption(
+        head: str, bits: list[str], url: str = "", note: str = ""
+    ) -> str:
+        """One short line the human reads above the picture."""
+
+        parts = [bit for bit in bits if bit and bit.strip() not in ("吧",)]
+        line = "【爱讨论·截图】" + head
+        if parts:
+            line += " · " + " · ".join(part.strip() for part in parts)
+        lines = [line]
+        remark = fmt.truncate(note, 120)
+        if remark:
+            lines.append(remark)
+        if url:
+            lines.append(url)
+        return "\n".join(lines)
 
     # ---------------------------------------------------------------- heartbeat
     def record_run(

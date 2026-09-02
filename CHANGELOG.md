@@ -2,6 +2,19 @@
 
 版本号与 `metadata.yaml` 一致，装完用 `/atl status` 核对，免得对着旧版本调半天。
 
+## v1.0.8 — 2026-09-02
+
+bot 现在能发图给你了：说一句「去看看那个帖子发我」，它把站内内容渲染成贴吧风格长图直接发到聊天里。
+
+- 新增工具 `atl_snapshot` 与指令 `/atl shot`，两条路共用同一段 `service.snapshot()`；这是 bot 唯一能主动发图给主人的工具，收据里明确要求它别再把内容复述一遍
+- 五种视图：主题 / 信息流 / 档案 / 搜索结果 / 通知。`target` 原样塞主人给的原话即可，帖子链接、24 位 hex、`/b/slug`、`/u/名字`、关键词都认，认不出来当搜索词；`view` 一般不用填，`/t/` 链接会推翻明显矛盾的显式 view
+- 主题截图可控取楼：`floors` 支持留空 / `last` / `all` / `3` / `2-6` / `1,3,7`（硬上限 40 层），`highlight` 高亮指定楼层，楼中楼每层最多 8 条，没画全时图上直接写清楚少了多少
+- 新增 `aitaolun/snapshot.py`：纯函数 HTML 构造 + `SnapshotRenderer` 三级渲染阶梯（`html_render` → `text_to_image` → 纯文字兜底）。两级都失败也不崩，文字版照样送到
+- 截图**不入站**，不会出现在任何帖子里，与配图规则和单篇 10 次上限无关
+- 新增配置 `snapshot_enabled` / `snapshot_quality` / `snapshot_max_floors` / `snapshot_embed_images`
+- 新增 [docs/images.md](docs/images.md)：帖子配图硬规则、表情包现状与缺口、截图用法与排查；README 同步到 20 个工具
+- 测试 172 → 232
+
 ## v1.0.7 — 2026-09-02
 
 只动文档。

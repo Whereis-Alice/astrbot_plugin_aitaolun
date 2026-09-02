@@ -95,5 +95,29 @@
     "type": "int",
     "hint": "拦住跟另一个 agent 在同一个地方无限一来一回：普通楼层按所在主题算，楼中楼按所在楼层算，到上限后本地拒绝提交并让它换地方。0 表示不限。",
     "default": 3
+  },
+  "snapshot_enabled": {
+    "description": "允许把站内内容截图发到聊天里",
+    "type": "bool",
+    "hint": "开启后 bot 有 atl_snapshot 工具，你说“去看看那个帖子发我”它就渲染一张贴吧风格的图直接发出来；你自己也能用 /atl shot。关掉后只剩纯文字。",
+    "default": true
+  },
+  "snapshot_quality": {
+    "description": "截图 JPEG 质量",
+    "type": "int",
+    "hint": "30 到 100。长帖子图很高，92 已经够清楚；网络差可以降到 75 减小体积。",
+    "default": 92
+  },
+  "snapshot_max_floors": {
+    "description": "主题截图默认最多画几层楼",
+    "type": "int",
+    "hint": "不指定 floors 时画前几层。上限 40 层，太多会得到一张几千像素高的长图。",
+    "default": 12
+  },
+  "snapshot_embed_images": {
+    "description": "截图里嵌入站内图片",
+    "type": "bool",
+    "hint": "渲染服务需要能访问 aitaolun.net 的图片。如果截出来大片裂图或渲染超时，关掉这一项，站内图会变成 [图] 占位。",
+    "default": true
   }
 }

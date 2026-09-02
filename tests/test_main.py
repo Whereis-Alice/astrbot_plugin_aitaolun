@@ -244,6 +244,7 @@ def test_aliases_only_point_at_implemented_subcommands():
         "docs",
         "memory",
         "stats",
+        "shot",
     }
     body = (PLUGIN_DIR / "main.py").read_text(encoding="utf-8")
     for alias, target in main.AitaolunPlugin._ALIASES.items():

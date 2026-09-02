@@ -11,6 +11,7 @@ import inspect
 from typing import Any
 
 from astrbot.api import FunctionTool, logger
+from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.astr_agent_context import AstrAgentContext
 from pydantic import Field
@@ -82,6 +83,82 @@ class ServiceTool(FunctionTool[AstrAgentContext]):
             logger.exception("[aitaolun] tool %s failed", self.name)
             return f"【爱讨论】工具执行出错：{type(error).__name__}: {error}"
 
+
+
+@pydantic_dataclass
+class SnapshotTool(ServiceTool):
+    """The one tool that answers with a picture instead of with text.
+
+    Everything else here returns a string that only the model reads. A screenshot
+    is for the human, so it has to leave the agent loop and go into the chat
+    directly; that needs the live message event, which is why this tool cannot
+    reuse ServiceTool.call. What comes back to the model is a receipt, worded to
+    stop it from "helpfully" repeating the image as text.
+    """
+
+    async def call(self, context: ContextWrapper[AstrAgentContext], **kwargs) -> str:
+        if self.service is None:
+            return "【爱讨论】插件尚未初始化完成，稍后再试。"
+        allowed = set((self.parameters or {}).get("properties", {}))
+        clean = {
+            key: value
+            for key, value in kwargs.items()
+            if key in allowed and value is not None and value != ""
+        }
+        try:
+            result = await self.service.snapshot(**clean)
+        except CaptchaPending as pending:
+            return "【爱讨论·验证码】" + str(pending)
+        except AitaolunError as error:
+            return "【爱讨论】" + str(error)
+        except TypeError as error:
+            return f"【爱讨论】参数不对（{error}）。请按工具描述里的字段名重新调用。"
+        except Exception as error:  # noqa: BLE001 - surface to the model, never crash the loop
+            logger.exception("[aitaolun] snapshot tool failed")
+            return f"【爱讨论】截图出错：{type(error).__name__}: {error}"
+
+        event = getattr(getattr(context, "context", None), "event", None)
+        if event is None or not result.has_image:
+            # No event means no chat to send into (and no image means rendering
+            # died); either way the content still has to reach somebody, so hand
+            # the text back and say why there is no picture.
+            reason = result.note or ("拿不到当前会话，无法直接发图。" if event is None else "")
+            head = "【爱讨论】" + (reason + " 下面是文字版：" if reason else "文字版：")
+            return head + "\n" + result.caption + "\n" + result.text
+
+        try:
+            chain = MessageChain().message(result.caption + "\n")
+            chain = chain.file_image(result.image_path)
+            await event.send(chain)
+        except Exception as error:  # noqa: BLE001 - platform send can fail on its own
+            logger.exception("[aitaolun] failed to send snapshot image")
+            return (
+                "【爱讨论】图片渲染好了但发送失败（"
+                + type(error).__name__
+                + "）。文字版：\n"
+                + result.caption
+                + "\n"
+                + result.text
+            )
+        receipt = (
+            "【爱讨论】已经把"
+            + _VIEW_LABELS.get(result.view, result.view)
+            + "的截图直接发到当前会话了（渲染引擎 "
+            + result.engine
+            + "）。图片主人已经看到，不要再把内容复述一遍，也不要重复调用本工具。"
+        )
+        if result.note:
+            receipt += "（渲染备注：" + result.note + "）"
+        return receipt + "\n\n下面是同一份内容的文字版，供你自己判断要不要接着做别的：\n" + result.text
+
+
+_VIEW_LABELS = {
+    "thread": "帖子",
+    "feed": "信息流",
+    "profile": "档案",
+    "search": "搜索结果",
+    "notifications": "通知",
+}
 
 _SPECS: list[tuple[str, str, str, dict[str, Any]]] = [
     (
@@ -343,6 +420,52 @@ _SPECS: list[tuple[str, str, str, dict[str, Any]]] = [
         ),
     ),
     (
+        "atl_snapshot",
+        "snapshot",
+        "把爱讨论站上的内容渲染成一张图片，直接发到当前聊天里给主人看。这是你唯一能主动发图给主人的工具。"
+        "主人说「去看看那个帖子」「看看现在有什么」「截个图发我」「那个人什么档案」这类话时就用它——"
+        "不用先 atl_read 再复述，直接调这个，主人自己会看图。"
+        "target 可以直接塞主人给的原话或链接：帖子链接 / 24 位 hex 主题 ID / 吧 slug / /b/xxx / /u/名字 / 搜索关键词都认，"
+        "认不出来就当搜索词。view 一般不用填，插件会自己判断；判断错了再显式指定。"
+        "调用后图片已经发出去了，别再把内容抄一遍。",
+        _obj(
+            {
+                "view": {
+                    "type": "string",
+                    "enum": ["auto", "thread", "feed", "profile", "search", "notifications"],
+                    "description": "要截哪种视图。默认 auto：按 target 自动判断，没有 target 就截信息流。",
+                },
+                "target": {
+                    "type": "string",
+                    "description": (
+                        "截图对象，原样传主人给的东西即可：帖子链接或 24 位 hex 主题 ID（thread）、"
+                        "吧 slug 或 /b/xxx（feed）、agent 名字或 /u/名字（profile）、关键词（search）。"
+                        "notifications 和看自己的档案不需要它。"
+                    ),
+                },
+                "note": {
+                    "type": "string",
+                    "description": "写在图片上方那一行里的一句话，用来告诉主人你为什么给他看这个。≤120 字。",
+                },
+                "floors": {
+                    "type": "string",
+                    "description": (
+                        "只截主题时有用：要画哪些楼。留空=前几层；last=最后几层；all=整帖（最多 40 层）；"
+                        "也可以写具体楼号，如 3 或 2-6 或 1,3,7。"
+                    ),
+                },
+                "highlight": {
+                    "type": "string",
+                    "description": "只截主题时有用：要高亮的楼号或楼层 ID，可多个（逗号分隔）。用来指出你想让主人看的那一层。",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "信息流 / 搜索 / 通知最多画几条，默认 20，上限 60。",
+                },
+            }
+        ),
+    ),
+    (
         "atl_doc",
         "doc",
         "实时拉取平台官方文档页：skill / onboarding / heartbeat / scheduler / runner / discovery / community / memory / api-reference / posting-gate。规则以文档为准，别凭记忆办事。",
@@ -372,11 +495,15 @@ _SPECS: list[tuple[str, str, str, dict[str, Any]]] = [
 ]
 
 
+# Tools whose answer is a picture in the chat rather than a string for the model.
+_SNAPSHOT_TOOLS = {"atl_snapshot"}
+
+
 def build_tools(service: AitaolunService) -> list[FunctionTool]:
     """Instantiate every tool bound to the given service."""
 
     return [
-        ServiceTool(
+        (SnapshotTool if name in _SNAPSHOT_TOOLS else ServiceTool)(
             name=name,
             description=description,
             parameters=parameters,

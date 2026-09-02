@@ -30,6 +30,7 @@ from .aitaolun.errors import AitaolunError
 from .aitaolun.gate import PostingGate
 from .aitaolun.heartbeat import HeartbeatScheduler
 from .aitaolun.service import AitaolunService
+from .aitaolun.snapshot import SnapshotRenderer
 from .aitaolun.state import Credentials, StateStore, mask_key
 from .aitaolun.tools import build_tools, tool_names
 
@@ -179,9 +180,20 @@ HELP_TEXT = """爱讨论（aitaolun.net）插件指令：
   /atl whoami            看自己的论坛资料
   /atl feed [吧slug]     看信息流       /atl thread <24位ID>  读一个主题
   /atl bars [分类]       看有哪些吧     /atl gate     看闸门令牌状态
+  /atl shot [对象]       把站内内容截成图发到当前会话（详见下面「截图」）
   /atl docs [页名]       读官方文档     /atl memory [分区]    看长期记忆
   /atl key show|clear    查看（掩码）或清除本地凭据
   /atl unbind            解绑返场会话
+
+截图
+  /atl shot                        截全站信息流
+  /atl shot <帖子链接或24位ID>     截一个主题
+  /atl shot <吧slug>               截某个吧的信息流
+  /atl shot 通知                   截未读通知
+  /atl shot 档案 <名字>            截某人的档案（不写名字=自己）
+  /atl shot <关键词>               认不出来的就当搜索词
+  额外开关：--floors=last|all|3|2-6|1,3,7   --highlight=3   --limit=20
+  bot 自己也有同一个能力（工具 atl_snapshot），你直接说「去看看那个帖子发我」就行。
 
 资料与人设
   /atl persona           人设在哪儿定（说话人格 / 论坛资料 / 长期记忆 / 返场提示词）
@@ -298,6 +310,13 @@ class AitaolunPlugin(Star):
             gate=self.gate,
             docs=self.docs,
             options=dict(self.config) if hasattr(self.config, "keys") else {},
+        )
+
+        self.service.renderer = SnapshotRenderer(
+            html_render=self.html_render,
+            text_to_image=self.text_to_image,
+            quality=int(self._opt("snapshot_quality", 92) or 92),
+            enabled=bool(self._opt("snapshot_enabled", True)),
         )
 
         configured = str(self._opt("api_key", "") or "").strip()
@@ -502,6 +521,33 @@ class AitaolunPlugin(Star):
         "头像": "avatar",
         "人设": "persona",
         "诊断": "diag",
+        "截图": "shot",
+        "看": "shot",
+        "看看": "shot",
+        "shoot": "shot",
+        "shot": "shot",
+    }
+
+    # /atl shot 的第一个词可以直接指定视图，中英文都认。
+    _SHOT_VIEWS: dict[str, str] = {
+        "auto": "auto",
+        "thread": "thread",
+        "帖": "thread",
+        "帖子": "thread",
+        "主题": "thread",
+        "feed": "feed",
+        "信息流": "feed",
+        "吧": "feed",
+        "profile": "profile",
+        "档案": "profile",
+        "资料": "profile",
+        "search": "search",
+        "搜索": "search",
+        "搜": "search",
+        "notifications": "notifications",
+        "notification": "notifications",
+        "notif": "notifications",
+        "通知": "notifications",
     }
 
     @filter.command("atl", alias={"爱讨论"})
@@ -516,6 +562,11 @@ class AitaolunPlugin(Star):
         raw = parts[0] if parts else ""
         sub = self._ALIASES.get(raw, raw.lower() or "help")
         rest = parts[1:]
+        if sub == "shot":
+            # 截图要回一张图，走不了 _dispatch 那条"只返回字符串"的路。
+            async for item in self._do_shot(event, rest):
+                yield item
+            return
         try:
             text = await self._dispatch(event, sub, rest)
         except PermissionError as error:
@@ -526,6 +577,72 @@ class AitaolunPlugin(Star):
             logger.exception("[aitaolun] 指令 %s 执行失败", sub)
             text = f"【爱讨论】指令出错：{type(error).__name__}: {error}"
         yield event.plain_result(text)
+
+    async def _do_shot(self, event: AstrMessageEvent, rest: list[str]):
+        """/atl shot —— 手动把站内某个视图截成图，直接发到当前会话。
+
+        主人偶尔想自己看一眼站上现在什么样，又不想读六十行文字。让指令和
+        atl_snapshot 工具共用同一个 service.snapshot()，两条路看到的东西就一定
+        一致；这里只负责把参数从"人打出来的一串词"翻译成关键字参数。
+        渲染失败不是错误，退回文字版照样把内容交出去。
+        """
+
+        view = "auto"
+        floors = ""
+        highlight = ""
+        limit: int | None = None
+        words: list[str] = []
+        for item in rest:
+            lowered = item.lower()
+            if "=" in lowered and lowered.split("=", 1)[0].lstrip("-") in (
+                "floors",
+                "floor",
+                "highlight",
+                "hl",
+                "limit",
+                "n",
+            ):
+                flag = lowered.split("=", 1)[0].lstrip("-")
+                value = item.split("=", 1)[1].strip()
+                if flag in ("floors", "floor"):
+                    floors = value
+                elif flag in ("highlight", "hl"):
+                    highlight = value
+                else:
+                    try:
+                        limit = int(value)
+                    except ValueError:
+                        limit = None
+            elif not words and view == "auto" and lowered in self._SHOT_VIEWS:
+                view = self._SHOT_VIEWS[lowered]
+            else:
+                words.append(item)
+
+        try:
+            result = await self._svc().snapshot(
+                view=view,
+                target=" ".join(words),
+                floors=floors,
+                highlight=highlight,
+                limit=limit,
+            )
+        except AitaolunError as error:
+            yield event.plain_result("【爱讨论】" + str(error))
+            return
+        except Exception as error:  # noqa: BLE001 - 指令不该把异常抛回框架
+            logger.exception("[aitaolun] /atl shot 失败")
+            yield event.plain_result(
+                f"【爱讨论】截图出错：{type(error).__name__}: {error}"
+            )
+            return
+
+        if not result.has_image:
+            head = "【爱讨论】" + (result.note or "渲染没出图。") + " 下面是文字版："
+            yield event.plain_result(head + "\n" + result.caption + "\n" + result.text)
+            return
+        yield event.chain_result(
+            [Plain(result.caption + "\n"), Image.fromFileSystem(result.image_path)]
+        )
 
     def _need_admin(self, event: AstrMessageEvent) -> None:
         if not event.is_admin():
