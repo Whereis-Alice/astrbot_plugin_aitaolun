@@ -10,9 +10,15 @@ import asyncio
 import time
 import types
 
+from aitaolun import formatting as fmt
 from aitaolun import snapshot as snap
+from aitaolun.constants import MAX_AVATAR_LOOKUPS
 from aitaolun.docs import DocPage, revision_of
-from aitaolun.errors import AitaolunConfigError, AitaolunGuardError
+from aitaolun.errors import (
+    AitaolunApiError,
+    AitaolunConfigError,
+    AitaolunGuardError,
+)
 from aitaolun.gate import PostingGate
 from aitaolun.service import AitaolunService
 from aitaolun.state import StateStore
@@ -21,6 +27,7 @@ from aitaolun.tools import SnapshotTool, build_tools
 ME = "测试机"
 TID = "b" * 24
 IMG = "/img/" + "a" * 24 + ".webp"
+AVATAR = "/avatar/v1/" + "a" * 24 + ".webp"
 SITE = snap.SITE_ORIGIN
 
 
@@ -130,8 +137,29 @@ def test_avatar_falls_back_to_a_stable_tile():
     assert 'class="avatar tile"' in snap._avatar_html(ME, IMG, False)
     real = snap._avatar_html(ME, IMG, True)
     assert real.startswith('<img class="avatar"')
-    assert SITE + IMG in real
+    assert SITE + AVATAR in real
     assert 'class="avatar tile"' in snap._avatar_html("", "", True)
+
+
+def test_avatar_of_digs_the_url_out_of_whatever_key_the_api_used():
+    for key in snap._AVATAR_KEYS:
+        assert snap.avatar_of({key: IMG}) == IMG, key
+    # /search spells an agent hit with a nested author object.
+    assert snap.avatar_of({"author": {"avatar_url": IMG}}) == IMG
+    # A name we have never seen still beats falling back to a letter tile.
+    assert snap.avatar_of({"writer_Avatar_thing": IMG}) == IMG
+    assert snap.avatar_of({"author_avatar": "  " + IMG + "  "}) == IMG
+    for nothing in ({}, {"author_avatar": ""}, {"author": "别人"}, None, "别人", []):
+        assert snap.avatar_of(nothing) == ""
+
+
+def test_avatar_url_is_rewritten_to_the_small_square():
+    assert snap._avatar_variant(IMG) == AVATAR
+    assert snap._avatar_variant(AVATAR) == AVATAR
+    for untouched in ("https://cdn.example/a.png", "/img/notahexid.webp", "/img/x"):
+        assert snap._avatar_variant(untouched) == untouched
+    for blank in ("", None, "   "):
+        assert snap._avatar_variant(blank) == ""
 
 
 def test_short_id_keeps_only_the_recognisable_tail():
@@ -235,6 +263,30 @@ def test_floor_numbers_mean_platform_numbers_not_list_offsets():
     assert "没有匹配" in snap.select_floors(items, "1")[1]
 
 
+def test_floors_that_state_no_number_are_counted_the_way_the_site_counts():
+    items = [{"id": "%024d" % n, "body": "第 %d 条" % n} for n in (1, 2, 3)]
+    # floor_count == replies + 1: the opening post is 1 楼, so replies start at 2.
+    table = snap.resolve_floor_numbers({"floor_count": 4}, items)
+    assert [table[id(item)] for item in items] == [2, 3, 4]
+    # Nothing to go on: count from 1 rather than print "? 楼" three times.
+    assert [snap.resolve_floor_numbers({}, items)[id(i)] for i in items] == [1, 2, 3]
+    # A partial read is not the root-apart case and must not be shifted.
+    assert [snap.resolve_floor_numbers({"floor_count": 40}, items)[id(i)] for i in items] == [1, 2, 3]
+    # The payload itself is never written to.
+    assert all("number" not in item for item in items)
+
+
+def test_stated_floor_numbers_win_unless_they_are_plainly_list_offsets():
+    stated = [{"number": n, "id": "%024d" % n} for n in (7, 8, 9)]
+    table = snap.resolve_floor_numbers({"floor_count": 4}, stated)
+    assert [table[id(item)] for item in stated] == [7, 8, 9]
+    # A reply cannot be 1 楼 when the opening post is one: that is a list index.
+    offsets = [{"number": n, "id": "%024d" % n} for n in (1, 2, 3)]
+    shifted = snap.resolve_floor_numbers({"floor_count": 4}, offsets)
+    assert [shifted[id(item)] for item in offsets] == [2, 3, 4]
+    assert snap.resolve_floor_numbers({}, []) == {}
+
+
 # ------------------------------------------------------------ target guessing
 
 
@@ -297,6 +349,52 @@ def test_thread_view_caps_the_subfloor_list():
 def test_thread_view_says_so_when_there_is_nothing_to_draw():
     assert "没有取到楼层" in snap.build_thread_html(thread_payload([]), ME)
     assert snap.build_thread_html(None, ME)
+
+
+def test_thread_view_draws_the_opening_post_the_floor_list_leaves_out():
+    page = snap.build_thread_html(thread_payload(body="我先问一句"), ME)
+    assert "我先问一句" in page
+    assert '<span class="badge tag">楼主</span>' in page
+    # No body to show, nothing to draw: the header already names the author.
+    assert '<span class="badge tag">楼主</span>' not in snap.build_thread_html(
+        thread_payload(), ME
+    )
+
+
+def test_the_opening_post_is_not_drawn_twice_when_the_payload_includes_it():
+    data = thread_payload(
+        [{"id": TID, "author_name": ME, "body": "我先问一句"}], body="我先问一句"
+    )
+    assert snap.build_thread_html(data, ME).count("我先问一句") == 1
+
+
+def test_thread_view_never_prints_an_unknown_floor_number():
+    items = [
+        {"id": "%024d" % n, "author_name": "别人", "body": "第 %d 条" % n}
+        for n in (1, 2, 3)
+    ]
+    page = snap.build_thread_html(thread_payload(items, floor_count=4), ME)
+    assert "? 楼" not in page
+    for label in ("2 楼", "3 楼", "4 楼"):
+        assert label in page, label
+
+
+def test_the_text_thread_view_shows_the_opening_post_and_real_floor_numbers():
+    text = fmt.fmt_thread(thread_payload(body="我先问一句"), me=ME)
+    assert "我先问一句" in text
+    assert "1 楼" in text and "（楼主）" in text
+    counted = fmt.fmt_thread(
+        {
+            "thread": {"id": TID, "title": "标题", "floor_count": 4},
+            "floors": [
+                {"id": "%024d" % n, "author_name": "别人", "body": "第 %d 条" % n}
+                for n in (1, 2, 3)
+            ],
+        }
+    )
+    assert "? 楼" not in counted
+    for label in ("2 楼", "3 楼", "4 楼"):
+        assert label in counted, label
 
 
 # ----------------------------------------------------------------- feed view
@@ -484,9 +582,18 @@ THREAD_PAYLOAD = {
         "title": "标题",
         "bar": "shuiba",
         "author_name": "别人",
+        "author_avatar": IMG,
         "floor_count": 1,
     },
-    "floors": [{"number": 1, "id": "d" * 24, "author_name": "别人", "body": "正文"}],
+    "floors": [
+        {
+            "number": 1,
+            "id": "d" * 24,
+            "author_name": "别人",
+            "author_avatar": IMG,
+            "body": "正文",
+        }
+    ],
 }
 
 
@@ -533,7 +640,13 @@ class ShotClient:
             {"unread": unread, "since": since},
             {
                 "notifications": [
-                    {"id": "d" * 24, "type": "reply", "from_name": "别人", "payload": {"body": "回你"}}
+                    {
+                        "id": "d" * 24,
+                        "type": "reply",
+                        "from_name": "别人",
+                        "from_avatar": IMG,
+                        "payload": {"body": "回你"},
+                    }
                 ]
             },
         )
@@ -743,7 +856,8 @@ def test_a_successful_snapshot_is_recorded_with_the_engine(tmp_path):
     service, store = build_service(tmp_path, client)
     result = run(service.snapshot("thread", TID, "看这个"))
     assert result.has_image and result.engine == "html"
-    assert result.caption.startswith("【爱讨论·截图】")
+    assert result.caption.startswith("主题《标题》")
+    assert "【" not in result.caption
     assert "看这个" in result.caption
     assert SITE + "/t/" + TID in result.caption
     record = store.runs(5)[0]
@@ -792,6 +906,71 @@ def test_taking_a_picture_of_a_thread_also_records_who_spoke(tmp_path):
     service, store = build_service(tmp_path, client)
     run(service.snapshot("thread", TID))
     assert store.thread_read(TID)["self_only"] is True
+
+
+def faceless_thread(*names):
+    """A thread payload whose authors carry no avatar of their own."""
+
+    return {
+        "thread": {"id": TID, "title": "标题", "bar": "shuiba", "author_name": "楼主甲"},
+        "floors": [
+            {"id": "%024d" % index, "author_name": name, "body": "第 %d 条" % index}
+            for index, name in enumerate(names, 1)
+        ],
+    }
+
+
+def test_a_face_the_payload_forgot_is_fetched_once_and_then_remembered(tmp_path):
+    client = ShotClient(
+        thread=faceless_thread("路人"), agent={"name": "路人", "avatar_url": IMG}
+    )
+    html_call = FakeRender("C:/tmp/a.jpg")
+    service, _ = build_service(
+        tmp_path, client, renderer=snap.SnapshotRenderer(html_render=html_call)
+    )
+    run(service.snapshot("thread", TID))
+    assert client.names().count("agent") == 2  # 楼主甲 and 路人
+    page = html_call.calls[0][0][0]
+    assert SITE + AVATAR in page
+    assert 'class="avatar tile"' not in page
+    # Second picture of the same thread: the faces are already known.
+    run(service.snapshot("thread", TID))
+    assert client.names().count("agent") == 2
+
+
+def test_avatar_lookups_are_capped_so_a_long_thread_cannot_fan_out(tmp_path):
+    client = ShotClient(
+        thread=faceless_thread(*["路人%d" % n for n in range(30)]),
+        agent={"avatar_url": IMG},
+    )
+    service, _ = build_service(tmp_path, client, options={"snapshot_max_floors": 40})
+    run(service.snapshot("thread", TID))
+    assert client.names().count("agent") == MAX_AVATAR_LOOKUPS
+
+
+def test_a_refused_avatar_lookup_costs_a_tile_not_the_screenshot(tmp_path):
+    client = ShotClient(
+        thread=faceless_thread("路人"),
+        agent=AitaolunApiError(429, "PUBLIC_RATE_LIMITED", retry_after=85),
+    )
+    html_call = FakeRender("C:/tmp/a.jpg")
+    service, store = build_service(
+        tmp_path, client, renderer=snap.SnapshotRenderer(html_render=html_call)
+    )
+    result = run(service.snapshot("thread", TID))
+    assert result.image_path == "C:/tmp/a.jpg"
+    assert 'class="avatar tile"' in html_call.calls[0][0][0]
+    # Losing a face is cosmetic; being rate limited is not, and is still recorded.
+    assert store.cooldown("public_write") is not None
+
+
+def test_nothing_is_fetched_for_faces_that_will_not_be_drawn(tmp_path):
+    client = ShotClient(thread=faceless_thread("路人"))
+    service, _ = build_service(
+        tmp_path, client, options={"snapshot_embed_images": "false"}
+    )
+    run(service.snapshot("thread", TID))
+    assert "agent" not in client.names()
 
 
 # ------------------------------------------------------------------- the tool

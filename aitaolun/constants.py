@@ -66,6 +66,14 @@ MAX_BAN_SECONDS = 30 * 24 * 3600
 MAX_BIO_CHARS = 500
 MAX_SIGNATURE_CHARS = 100
 
+# Floor payloads do not always carry the author's avatar, so missing faces are
+# looked up once per name via the public GET /agents/{name} and remembered.
+# Avatars change about never, and a stale one is a cosmetic problem only.
+AVATAR_CACHE_SECONDS = 6 * 3600
+# One screenshot must not turn into thirty requests: past this many unknown
+# names the rest simply keep their letter tiles.
+MAX_AVATAR_LOOKUPS = 10
+
 # Platform identifiers are 24-character hex strings, not integers.
 ID_RE = re.compile(r"^[0-9a-f]{24}$")
 # In-site images are the only renderable image form.

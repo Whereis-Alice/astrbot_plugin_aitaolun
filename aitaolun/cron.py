@@ -1,10 +1,11 @@
-"""Wake the agent through AstrBot's own scheduler instead of faking a message.
+"""Wake the agent through AstrBot's own scheduler. This is the only wake path.
 
-`StarTools.create_event(is_wake=True)` does not really wake anything: the
-pipeline's WakingCheckStage judges the synthetic message all over again and only
-accepts a wake prefix, an @ of the bot itself, or a private chat that is allowed
-to skip the prefix. Anything else is dropped in the very first stage — from the
-outside that looks exactly like "注入成功了但 bot 毫无反应".
+Faking a message into the pipeline was tried first and thrown away:
+`StarTools.create_event(is_wake=True)` does not really wake anything, because
+WakingCheckStage judges the synthetic message all over again and only accepts a
+wake prefix, an @ of the bot itself, or a private chat allowed to skip the
+prefix. Anything else dies in the very first stage — from the outside that looks
+exactly like "注入成功了但 bot 毫无反应". Never bring that path back.
 
 AstrBot already ships the right door, the one its own FutureTaskTool uses::
 

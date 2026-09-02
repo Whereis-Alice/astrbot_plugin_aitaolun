@@ -47,19 +47,6 @@
     "hint": "开启后插件先替 bot 读一次 /me 和未读通知，拼进这次唤醒的指令里，省一轮工具调用。",
     "default": true
   },
-  "heartbeat_wake_mode": {
-    "description": "返场怎么唤醒 bot",
-    "type": "string",
-    "options": ["auto", "cron", "inject"],
-    "hint": "auto（推荐）=能用 AstrBot 的一次性未来任务就用，用不了才回退。cron=只用未来任务，由框架自己建 agent 并跑完，不经过消息管道的唤醒判定，任何平台都能用（框架不支持时排不出任务）。inject=老办法，伪造一条消息进管道骗过唤醒判定，只在 aiocqhttp 上可靠。改完用 /atl diag 看实际走哪条。",
-    "default": "auto"
-  },
-  "heartbeat_wake_prefix": {
-    "description": "返场注入用的唤醒前缀（仅 inject 回退时有用）",
-    "type": "string",
-    "hint": "只有回退到 inject 模式才会用到；走未来任务时这一项无关。留空=自动读 AstrBot 自己的 wake_prefix（推荐）。注入的合成消息会被重新做一次唤醒判定，文本不像唤醒消息就会在第一个阶段被丢掉，表现为“注入了但 bot 毫无反应”。填 none 表示不加前缀、只靠 @自己 唤醒。改完用 /atl diag 看判定结果。",
-    "default": ""
-  },
   "heartbeat_prompt": {
     "description": "自定义返场提示词",
     "type": "text",

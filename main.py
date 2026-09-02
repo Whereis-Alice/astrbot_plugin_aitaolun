@@ -5,7 +5,7 @@ aitaolun.net 是一个只有 AI 能发言、人类只能围观的中文贴吧。
 2. 在本地兜住平台的所有硬规则（字数、图片、验证码、限流、重复内容、封禁），
    避免 bot 用一次次真实提交去试错；
 3. 定时"返场"：按间隔给 AstrBot 排一个一次性未来任务，由框架自己唤醒 bot，
-   让它自主跑一轮心跳后退出。
+   让它自主跑一轮心跳后退出（唯一的唤醒路径，不伪造消息进管道）。
 """
 
 from __future__ import annotations
@@ -16,9 +16,8 @@ from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import At, Image, Plain
+from astrbot.api.message_components import Image, Plain
 from astrbot.api.star import Context, Star, StarTools
-from astrbot.core.platform.astrbot_message import MessageMember
 from astrbot.core.platform.message_session import MessageSession
 
 from .aitaolun import formatting as fmt
@@ -40,10 +39,6 @@ PLUGIN_NAME = "astrbot_plugin_aitaolun"
 #: event.message_str 里剥掉了，这里仍然容错前缀，免得换个版本或换个平台就失灵。
 COMMAND_HEADS = ("atl", "爱讨论")
 _HEAD_PREFIX_CHARS = "/!！.。#>》、,，:：~～ \t"
-
-#: 返场怎么唤醒 bot。cron=AstrBot 一次性未来任务（正路），inject=伪造消息进管道
-#: （老版本框架的回退），auto=能用未来任务就用，不能才回退。
-WAKE_MODES = ("auto", "cron", "inject")
 
 
 def strip_command_head(message_str: str) -> str | None:
@@ -81,71 +76,6 @@ def collect_images(chain: Any) -> list[Any]:
             if isinstance(inner, Image):
                 quoted.append(inner)
     return direct + quoted
-
-
-def wake_prefix_for_injection(
-    bot_prefixes: Any,
-    provider_prefix: str = "",
-    override: str = "",
-) -> str:
-    """算出注入合成消息时必须自己带上的唤醒前缀。
-
-    StarTools.create_event(is_wake=True) 并不能真的唤醒：WakingCheckStage 会
-    重新判定一遍，只认「消息文本以 wake_prefix 开头」「@了机器人」「私聊且不要求
-    前缀」这三种情况，否则直接 stop_event()，整条 pipeline 在第一个阶段就断掉，
-    LLM 根本不会被调用。所以注入的文本必须自己长得像一条正常的唤醒消息。
-
-    provider_settings.wake_prefix（LLM 聊天的额外前缀）如果以机器人唤醒前缀开头，
-    框架会自己去掉重复的那一段，这里按同样的规则拼接。
-    """
-
-    forced = str(override or "")
-    if forced.strip():
-        return "" if forced.strip().lower() in ("none", "无", "空") else forced
-    bot_prefix = ""
-    candidates = [bot_prefixes] if isinstance(bot_prefixes, str) else list(bot_prefixes or [])
-    for item in candidates:
-        # 只去掉左边空白：有人把前缀配成 "/ "，右边那个空格是有意义的。
-        text = str(item or "").lstrip()
-        if text.strip():
-            bot_prefix = text
-            break
-    provider = str(provider_prefix or "")
-    if bot_prefix and provider.startswith(bot_prefix):
-        provider = provider[len(bot_prefix) :]
-    return bot_prefix + provider
-
-
-def wake_verdict(
-    msg_type: str,
-    prefix: str,
-    self_id: str,
-    wake_prefixes: Any,
-    friend_needs_prefix: bool,
-) -> tuple[bool, str]:
-    """按 WakingCheckStage 的规则预判：注入的消息会不会被判成「机器人被唤醒」。
-
-    这是 /atl diag 的核心：注入失败最常见的原因就是这一关，提前算出来
-    比让用户对着一片空白日志猜要快得多。
-    """
-
-    candidates = (
-        [wake_prefixes] if isinstance(wake_prefixes, str) else list(wake_prefixes or [])
-    )
-    prefixes = [str(item) for item in candidates if str(item)]
-    private = str(msg_type) == "FriendMessage"
-    if prefix and any(prefix.startswith(item) for item in prefixes):
-        return True, f"注入文本以唤醒前缀 {prefix!r} 开头 → 会被判定为唤醒。"
-    if self_id:
-        return True, f"消息链第一段是 @{self_id}（机器人自己）→ 会被判定为唤醒。"
-    if private and not friend_needs_prefix:
-        return True, "私聊且配置不要求唤醒前缀 → 会被判定为唤醒。"
-    return False, (
-        "既没有可用的唤醒前缀，也没记下机器人自己的 ID 来 @，"
-        + ("而且私聊被配置成必须带前缀。" if private else "而且这是群聊。")
-        + " 注入的消息会在 WakingCheckStage 被直接丢掉（表现就是「毫无反应」）。"
-        "解决办法：在 AstrBot 配置里设一个唤醒前缀，或者在目标会话重新执行一次 /atl bind。"
-    )
 
 
 def parse_arg_line(message_str: str, fallback: str = "") -> str:
@@ -237,62 +167,26 @@ class AitaolunPlugin(Star):
             return stored
         return str(self._opt("api_key", "") or "").strip()
 
-    def _astrbot_config(self, umo: str = "") -> Any:
-        """拿 AstrBot 自身的配置（可能按会话分档），拿不到就返回空 dict。"""
-
-        getter = getattr(self.context, "get_config", None)
-        if getter is None:
-            return {}
-        for args in ((umo,), ()) if umo else ((),):
-            try:
-                conf = getter(*args)
-            except Exception:  # noqa: BLE001 - 版本差异，签名可能不一样
-                continue
-            if hasattr(conf, "get"):
-                return conf
-        return {}
-
-    def _wake_prefix(self, umo: str = "") -> str:
-        """注入返场消息时要自己带上的唤醒前缀。"""
-
-        conf = self._astrbot_config(umo)
-        try:
-            bot_prefixes = conf.get("wake_prefix", []) or []
-        except Exception:  # noqa: BLE001
-            bot_prefixes = []
-        try:
-            provider = str((conf.get("provider_settings", {}) or {}).get("wake_prefix", "") or "")
-        except Exception:  # noqa: BLE001
-            provider = ""
-        override = str(self._opt("heartbeat_wake_prefix", "") or "")
-        return wake_prefix_for_injection(bot_prefixes, provider, override)
-
-    # ------------------------------------------------------------- wake mode
-    def _wake_mode(self) -> str:
-        """配置里选的唤醒方式，写错了当 auto。"""
-
-        mode = str(self._opt("heartbeat_wake_mode", "auto") or "auto").strip().lower()
-        return mode if mode in WAKE_MODES else "auto"
-
+    # ------------------------------------------------------------------- wake
     def _waker(self) -> CronWaker:
         """每次现取 cron_manager：插件热重载后不会攥着一个失效的引用。"""
 
         return CronWaker(getattr(self.context, "cron_manager", None))
 
-    def _effective_wake_mode(self) -> tuple[str, str]:
-        """返回 (这次真正会走的方式, 人类看得懂的一句话)。"""
+    #: 未来任务排不出去时说给主人听的那句话。返场只有这一条路：伪造一条消息塞
+    #: 进管道那套（is_wake=True + 唤醒前缀 + @自己）实测过不了唤醒判定，装着能
+    #: 用只会让人以为返场坏了，所以整条回退路径已经删掉。
+    CRON_MISSING = (
+        "这个 AstrBot 没有 cron_manager（未来任务），返场排不出去。"
+        "把 AstrBot 升级到带未来任务的版本即可；在那之前只能用 /atl heartbeat 手动跑一轮。"
+    )
 
-        mode = self._wake_mode()
-        if mode == "inject":
-            return "inject", "消息注入（配置里锁成了 inject）"
+    def _wake_status(self) -> tuple[bool, str]:
+        """(能不能唤醒, 人类看得懂的一句话)。"""
+
         if self._waker().available:
-            return "cron", "AstrBot 未来任务（框架直接唤醒 agent，不过管道的唤醒判定）"
-        if mode == "cron":
-            return (
-                "cron_unavailable",
-                "配置锁成了 cron，但这个 AstrBot 没有 cron_manager（版本太老），排不出任务",
-            )
-        return "inject", "消息注入（这个 AstrBot 没有 cron_manager，已自动回退）"
+            return True, "AstrBot 未来任务（框架直接建 agent 跑一轮，不经过消息管道）"
+        return False, "排不出去 —— " + self.CRON_MISSING
 
     # -------------------------------------------------------------- lifecycle
     async def initialize(self) -> None:
@@ -396,34 +290,25 @@ class AitaolunPlugin(Star):
     async def _wake(self, trigger: str, prompt: str) -> None:
         """唤醒 bot 跑一轮返场。
 
-        正路是 AstrBot 自己的一次性未来任务：框架建 agent、给全套工具、跑完写回
-        会话历史，完全不经过消息管道的唤醒判定。只有框架太老没有 cron_manager 时
-        才回退到「伪造一条消息塞进管道」那条骗唤醒的老路。
+        唯一的路子是 AstrBot 自己的一次性未来任务：框架建 agent、给全套工具、跑完
+        写回会话历史，完全不经过消息管道的唤醒判定。排不出去就如实记一条并告诉
+        主人，不再偷偷伪造一条消息塞进管道 —— 那条路过不了唤醒判定，只会表现成
+        「插件说发了，bot 毫无反应」。
         """
 
         umo = self.store.bound_session()
         if not umo:
             self.store.update_scheduler_state(last_error="未绑定会话")
             return
-        note = await self._wake_note(prompt)
-        mode = self._wake_mode()
         waker = self._waker()
-
-        if mode != "inject" and waker.available:
-            if await self._cron_wake(trigger, note, umo, waker):
-                return
-            if mode == "cron":
-                return  # 用户锁定了未来任务，不偷偷换成注入
-            logger.warning("[aitaolun] 未来任务排不出去，回退到消息注入唤醒")
-        elif mode == "cron":
-            detail = "这个 AstrBot 没有 cron_manager（版本太老），未来任务排不出去。"
-            logger.warning("[aitaolun] %s", detail)
-            self.store.update_scheduler_state(last_error=detail)
+        if not waker.available:
+            logger.warning("[aitaolun] %s", self.CRON_MISSING)
+            self.store.update_scheduler_state(last_error=self.CRON_MISSING)
             if self.service is not None:
-                self.service.record_run(trigger, "cron_unavailable", detail, umo)
+                self.service.record_run(trigger, "cron_unavailable", self.CRON_MISSING, umo)
             return
-
-        await self._inject_wake(trigger, note, umo)
+        note = await self._wake_note(prompt)
+        await self._cron_wake(trigger, note, umo, waker)
 
     async def _cron_wake(
         self, trigger: str, note: str, umo: str, waker: CronWaker
@@ -451,50 +336,6 @@ class AitaolunPlugin(Star):
                 umo,
             )
         return True
-
-    async def _inject_wake(self, trigger: str, note: str, umo: str) -> None:
-        """回退路线：伪造一条消息塞进管道，骗过 WakingCheckStage。"""
-
-        state = self.store.scheduler_state()
-        platform = str(state.get("platform") or "aiocqhttp")
-        sender_id = str(state.get("sender_id") or state.get("session_id") or "atl")
-        self_id = str(state.get("self_id") or "")
-        # 两道保险：文本自带唤醒前缀 + 消息链里 @ 自己。少了这一步 WakingCheckStage
-        # 会判定「没被唤醒」并直接掐断事件，表现就是「注入了但 bot 毫无反应」。
-        prefix = self._wake_prefix(umo)
-        text = prefix + note
-        try:
-            abm = await StarTools.create_message(
-                type=str(state.get("msg_type") or "FriendMessage"),
-                self_id=self_id,
-                session_id=str(state.get("session_id") or ""),
-                sender=MessageMember(
-                    user_id=sender_id,
-                    nickname=str(state.get("sender_name") or "爱讨论返场"),
-                ),
-                message=[At(qq=self_id), Plain(text)],
-                message_str=text,
-                group_id=str(state.get("group_id") or ""),
-            )
-            await StarTools.create_event(abm, platform=platform, is_wake=True)
-        except Exception as error:  # noqa: BLE001
-            logger.exception("[aitaolun] 返场注入失败")
-            self.store.update_scheduler_state(last_error=f"{type(error).__name__}: {error}")
-            if self.service is not None:
-                self.service.record_run(trigger, "inject_failed", str(error), umo)
-            return
-        logger.info(
-            "[aitaolun] 已注入返场事件：session=%s 类型=%s 唤醒前缀=%r",
-            umo,
-            state.get("msg_type") or "FriendMessage",
-            prefix,
-        )
-        self.store.update_scheduler_state(last_error="")
-        if self.service is not None:
-            self.service.record_run(
-                trigger, "injected", f"已注入唤醒事件（唤醒前缀 {prefix!r} + @自己）", umo
-            )
-
     # --------------------------------------------------------------- commands
     _ALIASES: dict[str, str] = {
         "": "help",
@@ -836,13 +677,8 @@ class AitaolunPlugin(Star):
             lines.append("本地冷却：无")
         if self.scheduler is not None:
             lines.append(self.scheduler.status_text())
-        mode, mode_note = self._effective_wake_mode()
-        lines.append("返场唤醒方式：" + mode_note)
-        if mode == "inject":
-            prefix = self._wake_prefix(self.store.bound_session() or "")
-            lines.append(
-                "注入唤醒前缀：" + (repr(prefix) if prefix else "(空，只靠 @自己 唤醒)")
-            )
+        ready, wake_note = self._wake_status()
+        lines.append(("返场唤醒方式：" if ready else "⚠ 返场唤醒：") + wake_note)
         if self.gate is not None:
             lines.append(self.gate.status_text())
         lines.append(f"已注册工具：{len(self._registered_tools)} 个")
@@ -856,15 +692,13 @@ class AitaolunPlugin(Star):
         if not umo:
             return "还没绑定会话。先在你想让它说话的那个会话里执行 /atl bind。"
         state = self.store.scheduler_state()
-        mode, mode_note = self._effective_wake_mode()
+        _, wake_note = self._wake_status()
         lines = [
             f"绑定会话：{umo}",
-            "唤醒方式：" + mode_note,
+            "唤醒方式：" + wake_note,
             "会话串能否解析：" + self._diag_session_verdict(umo),
         ]
         lines.extend(await self._diag_cron_lines())
-        if mode == "inject":
-            lines.extend(self._diag_inject_lines(umo, state))
         last_error = str(state.get("last_error") or "")
         if last_error:
             lines.append("上次唤醒报错：" + last_error)
@@ -926,33 +760,6 @@ class AitaolunPlugin(Star):
                 )
             )
         return lines
-
-    def _diag_inject_lines(self, umo: str, state: dict) -> list[str]:
-        """只有回退到消息注入时才需要关心唤醒判定。"""
-
-        conf = self._astrbot_config(umo)
-        try:
-            bot_prefixes = conf.get("wake_prefix", []) or []
-        except Exception:  # noqa: BLE001
-            bot_prefixes = []
-        try:
-            platform_settings = conf.get("platform_settings", {}) or {}
-            friend_needs = bool(platform_settings.get("friend_message_needs_wake_prefix", False))
-        except Exception:  # noqa: BLE001
-            friend_needs = False
-        msg_type = str(state.get("msg_type") or "FriendMessage")
-        self_id = str(state.get("self_id") or "")
-        prefix = self._wake_prefix(umo)
-        ok, why = wake_verdict(msg_type, prefix, self_id, bot_prefixes, friend_needs)
-        return [
-            f"会话类型：{msg_type}" + ("（群聊）" if msg_type == "GroupMessage" else "（私聊）"),
-            f"平台：{state.get('platform') or '(未记录)'}"
-            + f" | 机器人自己的 ID：{self_id or '(没记下，重新 bind 一次)'}",
-            "AstrBot 唤醒前缀：" + (repr(list(bot_prefixes)) if bot_prefixes else "(没设)"),
-            f"私聊是否必须带前缀：{'是' if friend_needs else '否'}",
-            "注入时自带的前缀：" + (repr(prefix) if prefix else "(空)"),
-            ("判定：会被唤醒 ✅ " if ok else "判定：不会被唤醒 ❌ ") + why,
-        ]
 
     def _persona_text(self) -> str:
         custom = bool(str(self._opt("heartbeat_prompt", "") or "").strip())
@@ -1070,22 +877,12 @@ class AitaolunPlugin(Star):
             sender_name=event.get_sender_name(),
             group_id=event.get_group_id() or "",
         )
-        mode, mode_note = self._effective_wake_mode()
-        note = ""
-        if mode == "inject" and platform != "aiocqhttp":
-            note = (
-                f"\n⚠ 当前平台是 {platform}，而这台 AstrBot 排不了未来任务，只能回退到消息注入，"
-                "注入目前只支持 aiocqhttp。把 AstrBot 升级到带未来任务的版本就没这个限制了。"
-            )
-        elif mode == "cron_unavailable":
-            note = (
-                "\n⚠ 配置里把 heartbeat_wake_mode 锁成了 cron，但这台 AstrBot 没有 cron_manager，"
-                "返场排不出去。改成 auto 或升级框架。"
-            )
+        ready, wake_note = self._wake_status()
+        note = "" if ready else "\n⚠ " + self.CRON_MISSING
         return (
             f"已把返场绑定到当前会话：{umo}\n"
             + ("返场调度已开启。" if self._sched().enabled else "提醒：配置里 heartbeat_enabled 还是关闭的，开了才会自动返场。")
-            + f"\n唤醒方式：{mode_note}"
+            + f"\n唤醒方式：{wake_note}"
             + note
         )
 
@@ -1107,13 +904,7 @@ class AitaolunPlugin(Star):
             )
         if status in ("cron_failed", "cron_unavailable"):
             return f"这一轮{label}没排出去：{record.detail}\n用 /atl diag 看详情。"
-        prefix = self._wake_prefix(self.store.bound_session() or "")
-        hint = (
-            f"（回退成消息注入，带唤醒前缀 {prefix!r} 并 @了自己）"
-            if prefix
-            else "（回退成消息注入，靠 @自己 唤醒）"
-        )
         return (
-            f"已手动触发一次{label}，接下来的动作由 bot 自己决定。{hint}\n"
-            "如果之后完全没动静：用 /atl runs 看有没有 injected，再确认这个会话没关掉 LLM。"
+            f"触发了{label}，但没拿到这一轮的排程记录，状态未知。\n"
+            "用 /atl runs 看最近几轮的结果，再用 /atl diag 确认返场唤醒是不是可用的。"
         )

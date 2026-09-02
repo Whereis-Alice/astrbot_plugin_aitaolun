@@ -247,11 +247,20 @@ def _fmt_subfloor(item: Any, me: str = "") -> str:
     )
 
 
-def _fmt_floor(item: Any, body_limit: int = 1200, me: str = "") -> str:
-    number = pick(item, "number", "floor_number", "index", default="?")
+def _fmt_floor(
+    item: Any,
+    body_limit: int = 1200,
+    me: str = "",
+    number: Any = None,
+    role: str = "",
+) -> str:
+    if number in (None, ""):
+        stated = floor_number(item)
+        number = stated if stated > 0 else "?"
     head = (
         f"{number} 楼 [{pick(item, 'id', '_id', default='?')}] "
         f"{_who(item, me)}"
+        f"{'（' + role + '）' if role else ''}"
         f" 赞{pick(item, 'upvotes', 'ups', default=0)}/踩{pick(item, 'downvotes', 'downs', default=0)}"
         f" {rel_time(pick(item, 'created_at'))}"
     )
@@ -273,6 +282,80 @@ def _last_voice(floors: list[Any]) -> Any:
     subfloors = as_list(tail, "subfloors", "sub_floors")
     return subfloors[-1] if subfloors else tail
 
+
+def _fmt_root(
+    thread: Any, floors: list[Any], body_limit: int = 1200, me: str = ""
+) -> str:
+    """The opening post as its own block.
+
+    GET /threads/{id} keeps the author's own text on the thread object, not in
+    the floor list, so a reader that only walked the floors saw the title and
+    the replies but never what the thread was actually about — and then answered
+    it anyway. Skipped when the payload already put the root in the floor list,
+    so a shape change cannot produce it twice.
+    """
+
+    if not isinstance(thread, dict):
+        return ""
+    ident = str(pick(thread, "id", "_id", "thread_id", default="") or "")
+    first = str(pick(floors[0], "id", "_id", default="") or "") if floors else ""
+    if ident and first and ident == first:
+        return ""
+    if not truncate(pick(thread, "body"), body_limit):
+        return ""
+    return _fmt_floor(thread, body_limit, me, 1, "楼主")
+
+
+FLOOR_NUMBER_KEYS = ("number", "floor_number", "floor_no", "index", "floor", "seq")
+
+
+def floor_number(item: Any) -> int:
+    """The floor number the payload stated, or -1 when it stated none."""
+
+    value = pick(item, *FLOOR_NUMBER_KEYS, default=None)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
+
+
+def floor_numbers(thread: Any, floors: list[Any]) -> dict[int, int]:
+    """Floor numbers keyed by id() of each floor dict.
+
+    GET /threads/{id} does not always state a number per floor, and printing "?
+    楼" everywhere makes a thread impossible to talk about — neither the model
+    nor the owner can then say "回 3 楼". So when every floor states its own
+    number we trust it, and otherwise we count.
+
+    The offset follows the site's own convention, confirmed against the rendered
+    thread page: the opening post is 1 楼 and replies start at 2. A floor_count
+    exactly one larger than the reply list is that case.
+
+    Returned as a side table instead of being written into the payload, so both
+    renderers can read the same untouched API data.
+    """
+
+    stated = {id(item): floor_number(item) for item in floors}
+    try:
+        total = int(pick(thread, "floor_count", "floors_count", default=None))
+    except (TypeError, ValueError):
+        total = -1
+    # A floor_count exactly one larger than the reply list means the list is
+    # every reply and the opening post is not in it.
+    root_apart = total == len(floors) + 1
+    if floors and all(value > 0 for value in stated.values()):
+        if root_apart and any(value == 1 for value in stated.values()):
+            # A reply cannot be 1 楼 when the opening post is, so this payload
+            # is numbering the list rather than the thread. Shift it onto the
+            # site's scale instead of drawing two different "1 楼" cards.
+            return {key: value + 1 for key, value in stated.items()}
+        return stated
+    base = 2 if root_apart else 1
+    out: dict[int, int] = {}
+    for index, item in enumerate(floors):
+        known = stated.get(id(item), -1)
+        out[id(item)] = known if known > 0 else base + index
+    return out
 
 def thread_parts(data: Any) -> tuple[Any, list[Any]]:
     """Split a GET /threads/{id} payload into (thread, floors)."""
@@ -345,10 +428,14 @@ def fmt_thread(
     if note:
         header.append(note)
     parts = ["\n".join(header)]
+    root = _fmt_root(thread, floors, body_limit, me)
+    if root:
+        parts.append(root)
     if not floors:
         parts.append("（本次没有返回楼层：可能是带了 since_floor 游标且没有新楼层）")
+    numbers = floor_numbers(thread, floors)
     for item in floors[:floor_limit]:
-        parts.append(_fmt_floor(item, body_limit, me))
+        parts.append(_fmt_floor(item, body_limit, me, numbers.get(id(item))))
     if len(floors) > floor_limit:
         parts.append(
             f"...（还有 {len(floors) - floor_limit} 层，用 since_floor 继续读）"

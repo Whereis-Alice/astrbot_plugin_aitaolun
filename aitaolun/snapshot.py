@@ -106,9 +106,69 @@ def _image_tag(src: Any, alt: Any = "", embed_images: bool = True) -> str:
     )
 
 
+_AVATAR_ID_RE = re.compile(r"^/img/([0-9a-f]{24})\.webp$")
+
+# Field names the API might use for "this author's avatar". The platform docs
+# never spell out the floor payload, and search results, /me and /agents/{name}
+# each spell it differently, so every observed and plausible name is tried.
+_AVATAR_KEYS = (
+    "author_avatar",
+    "author_avatar_url",
+    "avatar_url",
+    "avatar",
+    "avatar_path",
+    "author_image",
+    "author_avatar_path",
+    "icon_url",
+)
+
+
+def _avatar_variant(url: Any) -> str:
+    """Prefer the small square the site itself serves.
+
+    /img/<id>.webp is the full upload (~75KB); /avatar/v1/<id>.webp is the same
+    picture at avatar size (~15KB). A screenshot with a dozen avatars pulls a
+    dozen images through the remote renderer, so the small one is both faster
+    and less likely to time the render out. Anything unrecognised is returned
+    untouched.
+    """
+
+    text = str(url or "").strip()
+    match = _AVATAR_ID_RE.match(text)
+    if match:
+        return "/avatar/v1/" + match.group(1) + ".webp"
+    return text
+
+
+def avatar_of(item: Any) -> str:
+    """Dig an avatar URL out of one API item, whatever it decided to call it.
+
+    Tried in order: the known key names, then a nested author object, then any
+    key whose name merely contains "avatar". The last rule is deliberate: a
+    wrong-but-plausible field name should degrade into a working avatar rather
+    than into a letter tile, and a non-image string would just fail to load.
+    """
+
+    if not isinstance(item, dict):
+        return ""
+    for key in _AVATAR_KEYS:
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    author = item.get("author")
+    if isinstance(author, dict):
+        nested = avatar_of(author)
+        if nested:
+            return nested
+    for key, value in item.items():
+        if "avatar" in str(key).lower() and isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 def _avatar_html(name: Any, url: Any = "", embed_images: bool = True) -> str:
     label = str(name or "?").strip() or "?"
-    src = _abs_url(url) if embed_images else ""
+    src = _abs_url(_avatar_variant(url)) if embed_images else ""
     if src:
         return '<img class="avatar" src="' + esc(src) + '" alt="">'
     color = _AVATAR_COLORS[sum(ord(char) for char in label) % len(_AVATAR_COLORS)]
@@ -404,11 +464,13 @@ def _dot(bits: list[str]) -> str:
 
 
 def _floor_number(item: Any) -> int:
-    value = fmt.pick(item, "number", "floor_number", "index", "floor", default=None)
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return -1
+    return fmt.floor_number(item)
+
+
+def resolve_floor_numbers(thread: Any, floors: list[Any]) -> dict[int, int]:
+    """Floor numbers keyed by id() of each floor dict; see fmt.floor_numbers."""
+
+    return fmt.floor_numbers(thread, floors)
 
 
 def _short_id(value: Any) -> str:
@@ -446,7 +508,10 @@ def _parse_numbers(text: str) -> set[int]:
 
 
 def select_floors(
-    floors: list[Any], spec: str = "", cap: int = DEFAULT_MAX_FLOORS
+    floors: list[Any],
+    spec: str = "",
+    cap: int = DEFAULT_MAX_FLOORS,
+    numbers: dict[int, int] | None = None,
 ) -> tuple[list[Any], str]:
     """Pick which floors to draw, accepting what a human would actually type.
 
@@ -493,7 +558,12 @@ def select_floors(
     if not wanted:
         picked = floors[:cap]
         return picked, "看不懂 floors=" + str(spec) + "，按默认画了前 " + str(len(picked)) + " 层。"
-    picked = [item for item in floors if _floor_number(item) in wanted][:HARD_MAX_FLOORS]
+    table = numbers or {}
+    picked = [
+        item
+        for item in floors
+        if (table.get(id(item)) or _floor_number(item)) in wanted
+    ][:HARD_MAX_FLOORS]
     if not picked:
         fallback = floors[:cap]
         return fallback, "没有匹配 floors=" + str(spec) + " 的楼层，改画了前 " + str(len(fallback)) + " 层。"
@@ -540,8 +610,13 @@ def _floor_card(
     me: str = "",
     highlight: set[str] | None = None,
     embed_images: bool = True,
+    number: Any = None,
+    avatars: dict[str, str] | None = None,
+    role: str = "",
 ) -> str:
-    number = fmt.pick(item, "number", "floor_number", "index", default="?")
+    if number in (None, ""):
+        stated = _floor_number(item)
+        number = stated if stated > 0 else "?"
     ident = str(fmt.pick(item, "id", "_id", default="") or "")
     name = fmt.author_of(item) or "?"
     stamp = fmt.rel_time(fmt.pick(item, "created_at"))
@@ -554,13 +629,14 @@ def _floor_card(
         '<div class="who">'
         + _avatar_html(
             name,
-            fmt.pick(item, "author_avatar", "avatar_url", "avatar", default=""),
+            avatar_of(item) or (avatars or {}).get(name, ""),
             embed_images,
         )
         + '<span class="name">'
         + esc(name)
         + "</span>"
         + (_badge("你", "me") if me and name == me else "")
+        + (_badge(role) if role else "")
         + '<span class="grow"></span><span class="num">'
         + esc(number)
         + " 楼</span>"
@@ -597,6 +673,34 @@ def _floor_card(
     return '<div class="' + classes + '">' + head + body + meta + sub_html + "</div>"
 
 
+def _root_card(
+    thread: Any,
+    floors: list[Any],
+    me: str = "",
+    highlight: set[str] | None = None,
+    embed_images: bool = True,
+    avatars: dict[str, str] | None = None,
+) -> str:
+    """The opening post, which the floor list does not contain.
+
+    Without this the screenshot is a stack of answers to an invisible question:
+    the title is in the header, but what the author actually wrote is nowhere.
+    Drawn through the same card as a floor so it reads as 1 楼, which is how the
+    site numbers it. Skipped when the payload already put the root in the floor
+    list, so the shape can change under us without producing a duplicate.
+    """
+
+    if not isinstance(thread, dict):
+        return ""
+    ident = str(fmt.pick(thread, "id", "_id", "thread_id", default="") or "")
+    first = str(fmt.pick(floors[0], "id", "_id", default="") or "") if floors else ""
+    if ident and first and ident == first:
+        return ""
+    if not str(fmt.pick(thread, "body", default="") or "").strip():
+        return ""
+    return _floor_card(thread, me, highlight, embed_images, 1, avatars, "楼主")
+
+
 def build_thread_html(
     data: Any,
     me: str = "",
@@ -604,10 +708,12 @@ def build_thread_html(
     highlight: str = "",
     max_floors: int = DEFAULT_MAX_FLOORS,
     embed_images: bool = True,
+    avatars: dict[str, str] | None = None,
 ) -> str:
     thread, all_floors = fmt.thread_parts(data)
     thread_id = str(fmt.pick(thread, "id", "_id", "thread_id", default="") or "")
-    picked, note = select_floors(all_floors, floors, max_floors)
+    numbers = resolve_floor_numbers(thread, all_floors)
+    picked, note = select_floors(all_floors, floors, max_floors, numbers)
 
     # Titles are plain text on the platform, but the model does type **bold**
     # into them, and a screenshot showing raw asterisks looks broken. Badges stay
@@ -636,8 +742,15 @@ def build_thread_html(
     ) + flags
 
     keys = _highlight_keys(highlight)
-    cards = [_floor_card(item, me, keys, embed_images) for item in picked]
-    if not cards:
+    cards: list[str] = []
+    root = _root_card(thread, all_floors, me, keys, embed_images, avatars)
+    if root:
+        cards.append(root)
+    cards.extend(
+        _floor_card(item, me, keys, embed_images, numbers.get(id(item)), avatars)
+        for item in picked
+    )
+    if not picked:
         cards.append(
             '<div class="card"><p class="muted">这次没有取到楼层，'
             "可能是带了 since_floor 游标而没有新楼。</p></div>"
@@ -655,6 +768,7 @@ def build_feed_html(
     bar: str = "",
     limit: int = DEFAULT_MAX_ITEMS,
     embed_images: bool = True,
+    avatars: dict[str, str] | None = None,
 ) -> str:
     items = fmt.as_list(data, "threads", "feed", "items", "results")
     cap = max(1, min(int(limit or DEFAULT_MAX_ITEMS), HARD_MAX_ITEMS))
@@ -675,7 +789,9 @@ def build_feed_html(
         rows.append(
             '<div class="card row"><div class="rank">'
             + str(index)
-            + '</div><div class="rowmain"><div class="rowtitle">'
+            + "</div>"
+            + _avatar_html(name, avatar_of(item) or (avatars or {}).get(name, ""), embed_images)
+            + '<div class="rowmain"><div class="rowtitle">'
             + title
             + "</div>"
             + (
@@ -814,7 +930,7 @@ def build_profile_html(data: Any, embed_images: bool = True) -> str:
 
     hero = (
         '<div class="card"><div class="hero">'
-        + _avatar_html(name, fmt.pick(agent, "avatar_url", "avatar", default=""), embed_images)
+        + _avatar_html(name, avatar_of(agent), embed_images)
         + '<div class="rowmain"><div class="who2">'
         + esc(name)
         + (
@@ -876,7 +992,13 @@ def build_profile_html(data: Any, embed_images: bool = True) -> str:
 # ----------------------------------------------------------------- search view
 
 
-def build_search_html(data: Any, query: str = "", limit: int = DEFAULT_MAX_ITEMS) -> str:
+def build_search_html(
+    data: Any,
+    query: str = "",
+    limit: int = DEFAULT_MAX_ITEMS,
+    embed_images: bool = True,
+    avatars: dict[str, str] | None = None,
+) -> str:
     cap = max(1, min(int(limit or DEFAULT_MAX_ITEMS), HARD_MAX_ITEMS))
     threads = fmt.as_list(data, "threads")
     bars = fmt.as_list(data, "bars")
@@ -886,8 +1008,11 @@ def build_search_html(data: Any, query: str = "", limit: int = DEFAULT_MAX_ITEMS
     if threads:
         blocks.append('<div class="sect">主题 ' + str(len(threads)) + " 条</div>")
         for item in threads[:cap]:
+            who = fmt.author_of(item) or "?"
             blocks.append(
-                '<div class="card row"><div class="rowmain"><div class="rowtitle">'
+                '<div class="card row">'
+                + _avatar_html(who, avatar_of(item) or (avatars or {}).get(who, ""), embed_images)
+                + '<div class="rowmain"><div class="rowtitle">'
                 + esc(fmt.truncate(fmt.pick(item, "title", default="(无标题)"), 90))
                 + '</div><div class="rowmeta">'
                 + _dot(
@@ -924,7 +1049,9 @@ def build_search_html(data: Any, query: str = "", limit: int = DEFAULT_MAX_ITEMS
         for item in agents[:cap]:
             blocks.append(
                 '<div class="card row">'
-                + _avatar_html(fmt.pick(item, "name", default="?"), "", False)
+                + _avatar_html(
+                    fmt.pick(item, "name", default="?"), avatar_of(item), embed_images
+                )
                 + '<div class="rowmain"><div class="rowtitle">'
                 + esc(fmt.pick(item, "name", default="?"))
                 + '</div><div class="rowmeta">'
@@ -962,7 +1089,12 @@ _NOTIFICATION_LABELS: dict[str, str] = {
 }
 
 
-def build_notifications_html(data: Any, limit: int = DEFAULT_MAX_ITEMS) -> str:
+def build_notifications_html(
+    data: Any,
+    limit: int = DEFAULT_MAX_ITEMS,
+    embed_images: bool = True,
+    avatars: dict[str, str] | None = None,
+) -> str:
     items = fmt.as_list(data, "notifications", "items", "results")
     cap = max(1, min(int(limit or DEFAULT_MAX_ITEMS), HARD_MAX_ITEMS))
     rows: list[str] = []
@@ -978,7 +1110,9 @@ def build_notifications_html(data: Any, limit: int = DEFAULT_MAX_ITEMS) -> str:
             )
         rows.append(
             '<div class="card row">'
-            + _avatar_html(actor, "", False)
+            + _avatar_html(
+                actor, avatar_of(item) or (avatars or {}).get(actor, ""), embed_images
+            )
             + '<div class="rowmain"><div class="rowtitle">'
             + _badge(label)
             + " "

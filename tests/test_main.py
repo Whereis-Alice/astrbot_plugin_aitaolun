@@ -43,14 +43,6 @@ class DummyContext:
     def get_llm_tool_manager(self):
         return self.manager
 
-    def get_config(self, umo=None):
-        # 模拟用户真实的 AstrBot 配置：全角逗号唤醒前缀 + 私聊不要求前缀
-        return {
-            "wake_prefix": ["，"],
-            "provider_settings": {"wake_prefix": ""},
-            "platform_settings": {"friend_message_needs_wake_prefix": False},
-        }
-
 
 class FakeEvent:
     def __init__(
@@ -318,8 +310,11 @@ def test_claim_flow(tmp_path, monkeypatch):
     assert "已经标记为已认领" in dispatch(plugin, "claim")
 
 
-def test_bind_records_the_session_and_warns_on_other_platforms(tmp_path, monkeypatch):
-    plugin, _ = wired(tmp_path, monkeypatch, {"heartbeat_enabled": True})
+def test_bind_records_the_session_on_any_platform(tmp_path, monkeypatch):
+    """未来任务不经过消息管道，所以绑定哪个平台都一样，不再有 aiocqhttp 限制。"""
+
+    plugin, context = wired(tmp_path, monkeypatch, {"heartbeat_enabled": True})
+    with_cron(plugin, context)
     text = dispatch(plugin, "bind")
     state = plugin.store.scheduler_state()
     assert plugin.store.bound_session() == "aiocqhttp:FriendMessage:sess-1"
@@ -330,7 +325,9 @@ def test_bind_records_the_session_and_warns_on_other_platforms(tmp_path, monkeyp
     assert "⚠" not in text
 
     other = dispatch(plugin, "bind", event=FakeEvent(platform="telegram"))
-    assert "只支持 aiocqhttp" in other
+    assert "telegram:FriendMessage:sess-1" in other
+    assert "⚠" not in other
+    assert plugin.store.scheduler_state()["platform"] == "telegram"
 
     assert "已解绑" in dispatch(plugin, "unbind")
     assert plugin.store.bound_session() == ""
@@ -378,7 +375,7 @@ def test_status_surfaces_the_ban_latch_and_cooldowns(tmp_path, monkeypatch):
 def test_runs_and_memory_and_gate_are_local_only(tmp_path, monkeypatch):
     plugin, _ = wired(tmp_path, monkeypatch)
     assert "还没有返场记录" in dispatch(plugin, "runs")
-    plugin.service.record_run("heartbeat", "injected", "试跑", "sess")
+    plugin.service.record_run("heartbeat", "cron_armed", "试跑", "sess")
     assert "试跑" in dispatch(plugin, "runs")
 
     plugin.service.memory("write", "persona", "爱吵架")
@@ -510,97 +507,6 @@ def test_atl_command_reports_permission_errors_instead_of_raising(
     assert "只能在私聊里做" in drive(plugin, event)[0]
 
 
-# ------------------------------------------------------- wake prefix / 注入诊断
-
-
-def test_wake_prefix_for_injection_covers_every_branch():
-    # 没有任何前缀配置 → 只能靠 @自己
-    assert main.wake_prefix_for_injection([], "") == ""
-    # 取第一个非空的 bot 前缀，右侧空格是有意义的，只 lstrip
-    assert main.wake_prefix_for_injection(["", "  / "], "") == "/ "
-    assert main.wake_prefix_for_injection("，", "") == "，"
-    # provider_settings.wake_prefix 与 bot 前缀重复的那一段由框架去掉
-    assert main.wake_prefix_for_injection(["/"], "/chat ") == "/chat "
-    assert main.wake_prefix_for_injection(["，"], "聊天 ") == "，聊天 "
-    # 配置项可以强制覆盖，写 none 表示彻底不加前缀
-    assert main.wake_prefix_for_injection(["，"], "", "!") == "!"
-    assert main.wake_prefix_for_injection(["，"], "", " none ") == ""
-    assert main.wake_prefix_for_injection(["，"], "", "无") == ""
-
-
-def test_wake_verdict_mirrors_the_waking_check_stage():
-    ok, why = main.wake_verdict("GroupMessage", "，", "", ["，"], False)
-    assert ok and "唤醒前缀" in why
-    # 没有可用前缀但记下了自己的 ID → @自己 也算唤醒
-    ok, why = main.wake_verdict("GroupMessage", "", "bot-1", [], False)
-    assert ok and "@bot-1" in why
-    ok, why = main.wake_verdict("FriendMessage", "", "", [], False)
-    assert ok and "私聊" in why
-    # 群聊 + 没前缀 + 没 self_id：这就是「注入了但毫无反应」的根因
-    ok, why = main.wake_verdict("GroupMessage", "", "", [], False)
-    assert not ok and "WakingCheckStage" in why and "群聊" in why
-    ok, why = main.wake_verdict("FriendMessage", "", "", [], True)
-    assert not ok and "必须带前缀" in why
-
-
-def captured_injection(plugin, monkeypatch):
-    """替掉 StarTools 的两个静态方法，把注入的参数抓回来。"""
-
-    box = {}
-
-    async def fake_create_message(**kwargs):
-        box.update(kwargs)
-        return SimpleNamespace(**kwargs)
-
-    async def fake_create_event(abm, platform="", is_wake=False):
-        box["platform"] = platform
-        box["is_wake"] = is_wake
-        return None
-
-    monkeypatch.setattr(
-        main.StarTools, "create_message", staticmethod(fake_create_message)
-    )
-    monkeypatch.setattr(main.StarTools, "create_event", staticmethod(fake_create_event))
-    return box
-
-
-def test_wake_injects_the_prefix_and_an_at_self_segment(tmp_path, monkeypatch):
-    plugin, _ = wired(tmp_path, monkeypatch, {"heartbeat_include_brief": False})
-    dispatch(plugin, "bind")
-    box = captured_injection(plugin, monkeypatch)
-
-    run(plugin._wake("heartbeat", "该返场了"))
-
-    assert box["is_wake"] is True
-    assert box["platform"] == "aiocqhttp"
-    assert box["self_id"] == "bot-1"
-    # 文本自带唤醒前缀
-    assert box["message_str"] == "，该返场了"
-    # 消息链第一段是 @自己，这是第二道保险
-    assert isinstance(box["message"][0], main.At)
-    assert str(box["message"][0].qq) == "bot-1"
-    assert box["message"][1].text == "，该返场了"
-
-    state = plugin.store.scheduler_state()
-    assert state["last_error"] == ""
-    runs = plugin.store.runs(1)
-    assert runs[0].status == "injected" and "@自己" in runs[0].detail
-
-
-def test_wake_records_injection_failures(tmp_path, monkeypatch):
-    plugin, _ = wired(tmp_path, monkeypatch, {"heartbeat_include_brief": False})
-    dispatch(plugin, "bind")
-
-    async def boom(**kwargs):
-        raise RuntimeError("平台没连上")
-
-    monkeypatch.setattr(main.StarTools, "create_message", staticmethod(boom))
-    run(plugin._wake("heartbeat", "该返场了"))
-
-    assert "平台没连上" in plugin.store.scheduler_state()["last_error"]
-    assert plugin.store.runs(1)[0].status == "inject_failed"
-
-
 # --------------------------------------------------------- future-task waking
 
 
@@ -636,16 +542,24 @@ def with_cron(plugin, context, **kwargs):
     return manager
 
 
+def forbid_injection(monkeypatch):
+    """伪造消息进管道那条路已经删掉了；谁把它加回来，这两个桩就让测试红。"""
+
+    async def refuse(*args, **kwargs):
+        raise AssertionError("返场不许伪造消息进消息管道")
+
+    monkeypatch.setattr(main.StarTools, "create_message", staticmethod(refuse))
+    monkeypatch.setattr(main.StarTools, "create_event", staticmethod(refuse))
+
+
 def test_wake_arms_a_future_task_when_the_framework_supports_it(tmp_path, monkeypatch):
     plugin, context = wired(tmp_path, monkeypatch, {"heartbeat_include_brief": False})
     manager = with_cron(plugin, context)
     dispatch(plugin, "bind")
-    box = captured_injection(plugin, monkeypatch)
+    forbid_injection(monkeypatch)
 
     run(plugin._wake("heartbeat", "该返场了"))
 
-    # 走的是框架的未来任务，一条合成消息都没伪造
-    assert box == {}
     payload = manager.calls[0]["payload"]
     assert payload["session"] == "aiocqhttp:FriendMessage:sess-1"
     assert payload["note"] == "该返场了"
@@ -657,62 +571,47 @@ def test_wake_arms_a_future_task_when_the_framework_supports_it(tmp_path, monkey
     assert plugin.store.scheduler_state()["last_error"] == ""
 
 
-def test_wake_falls_back_to_injection_when_arming_fails(tmp_path, monkeypatch):
+def test_a_framework_without_future_tasks_skips_the_round_and_says_why(
+    tmp_path, monkeypatch
+):
+    """没有 cron_manager 就没有唤醒办法：如实记一条，不许绕路。"""
+
+    plugin, _ = wired(tmp_path, monkeypatch, {"heartbeat_include_brief": False})
+    dispatch(plugin, "bind")
+    forbid_injection(monkeypatch)
+
+    run(plugin._wake("heartbeat", "该返场了"))
+
+    record = plugin.store.runs(1)[0]
+    assert record.status == "cron_unavailable"
+    assert "cron_manager" in record.detail
+    assert "cron_manager" in plugin.store.scheduler_state()["last_error"]
+
+
+def test_an_unarmable_future_task_is_recorded_instead_of_worked_around(
+    tmp_path, monkeypatch
+):
     plugin, context = wired(tmp_path, monkeypatch, {"heartbeat_include_brief": False})
     with_cron(plugin, context, boom=True)
     dispatch(plugin, "bind")
-    box = captured_injection(plugin, monkeypatch)
+    forbid_injection(monkeypatch)
 
     run(plugin._wake("heartbeat", "该返场了"))
 
-    assert box["is_wake"] is True  # auto 模式：排不出去就退回注入
-    statuses = [item.status for item in plugin.store.runs(2)]  # 新的在前
-    assert statuses == ["injected", "cron_failed"]
+    record = plugin.store.runs(1)[0]
+    assert record.status == "cron_failed" and "数据库挂了" in record.detail
 
 
-def test_wake_mode_cron_never_silently_falls_back(tmp_path, monkeypatch):
-    plugin, context = wired(
-        tmp_path,
-        monkeypatch,
-        {"heartbeat_include_brief": False, "heartbeat_wake_mode": "cron"},
-    )
-    dispatch(plugin, "bind")
-    box = captured_injection(plugin, monkeypatch)
+def test_wake_status_rereads_the_framework_every_time(tmp_path, monkeypatch):
+    """插件热重载后 cron_manager 会换一个对象，状态不能缓存。"""
 
-    # 没有 cron_manager：锁死 cron 就宁可不发，也不悄悄换成注入
-    run(plugin._wake("heartbeat", "该返场了"))
-    assert box == {}
-    assert plugin.store.runs(1)[0].status == "cron_unavailable"
+    plugin, context = wired(tmp_path, monkeypatch)
+    ready_now, note = plugin._wake_status()
+    assert ready_now is False and "cron_manager" in note
 
-    with_cron(plugin, context, boom=True)
-    run(plugin._wake("heartbeat", "该返场了"))
-    assert box == {}
-    assert plugin.store.runs(1)[0].status == "cron_failed"
-
-
-def test_wake_mode_inject_ignores_the_scheduler(tmp_path, monkeypatch):
-    plugin, context = wired(
-        tmp_path,
-        monkeypatch,
-        {"heartbeat_include_brief": False, "heartbeat_wake_mode": "inject"},
-    )
-    manager = with_cron(plugin, context)
-    dispatch(plugin, "bind")
-    box = captured_injection(plugin, monkeypatch)
-
-    run(plugin._wake("heartbeat", "该返场了"))
-
-    assert manager.calls == []
-    assert box["message_str"] == "，该返场了"
-    assert plugin.store.runs(1)[0].status == "injected"
-
-
-def test_unknown_wake_mode_degrades_to_auto(tmp_path, monkeypatch):
-    plugin, context = wired(tmp_path, monkeypatch, {"heartbeat_wake_mode": "MAGIC"})
-    assert plugin._wake_mode() == "auto"
-    assert plugin._effective_wake_mode()[0] == "inject"
     with_cron(plugin, context)
-    assert plugin._effective_wake_mode()[0] == "cron"
+    ready_now, note = plugin._wake_status()
+    assert ready_now is True and "未来任务" in note
 
 
 def test_manual_trigger_reports_the_future_task(tmp_path, monkeypatch):
@@ -779,8 +678,10 @@ def test_purge_failures_never_block_startup(tmp_path, monkeypatch):
     run(scenario())
 
 
-def test_diag_explains_whether_the_injection_will_wake_the_bot(tmp_path, monkeypatch):
-    """没有 cron_manager 的老框架：诊断要讲清楚注入这条回退路能不能唤醒。"""
+def test_diag_says_plainly_that_a_framework_without_future_tasks_cannot_wake(
+    tmp_path, monkeypatch
+):
+    """没有 cron_manager 的框架：诊断必须直说排不出去，别给假希望。"""
 
     plugin, _ = wired(tmp_path, monkeypatch)
     assert "先在你想让它说话的那个会话里执行 /atl bind" in dispatch(plugin, "diag")
@@ -789,25 +690,21 @@ def test_diag_explains_whether_the_injection_will_wake_the_bot(tmp_path, monkeyp
     text = dispatch(plugin, "diag")
     assert "返场诊断" in text
     assert "aiocqhttp:FriendMessage:sess-1" in text
-    assert "已自动回退" in text  # 没有 cron_manager
+    assert "AstrBot 未来任务：不可用" in text
     assert "会话串能否解析：✅" in text
-    assert "会被唤醒 ✅" in text
-    assert "'，'" in text  # 自动读到的唤醒前缀
     assert "还没跑过" in text
+    # 唤醒判定、唤醒前缀这些概念已经和返场无关了，别再出现在诊断里
+    assert "唤醒前缀" not in text and "会被唤醒" not in text
 
 
-def test_diag_flags_a_group_binding_without_any_wake_signal(tmp_path, monkeypatch):
-    plugin, context = wired(tmp_path, monkeypatch, {"heartbeat_wake_prefix": "none"})
-    monkeypatch.setattr(context, "get_config", lambda umo=None: {}, raising=False)
-    dispatch(plugin, "bind", event=FakeEvent(private=False, group_id="g-1"))
-    # 手动抹掉 self_id，模拟老版本 bind 留下的残缺状态
-    plugin.store.update_scheduler_state(self_id="", msg_type="GroupMessage")
-
-    text = dispatch(plugin, "diag")
-    assert "不会被唤醒 ❌" in text
-    assert "群聊" in text
-    assert "重新 bind" in text
-
+def test_bind_warns_up_front_when_the_framework_cannot_schedule(tmp_path, monkeypatch):
+    plugin, _ = wired(tmp_path, monkeypatch, {"heartbeat_enabled": True})
+    text = dispatch(plugin, "bind")
+    assert "已把返场绑定到当前会话" in text
+    assert "⚠" in text and "cron_manager" in text
+    assert "/atl heartbeat" in text
+    # 状态页同样标红，而不是若无其事地报一条"唤醒方式"
+    assert "⚠ 返场唤醒" in dispatch(plugin, "status")
 
 def test_persona_lists_all_four_layers(tmp_path, monkeypatch):
     plugin, _ = wired(tmp_path, monkeypatch)

@@ -1,6 +1,6 @@
 # 返场：它什么时候自己动，不动时查哪里
 
-没动静先跑 `/atl diag`，一页告诉你这次走的哪条路、卡在哪。
+没动静先跑 `/atl diag`，一页告诉你返场排不排得出去、上一轮停在哪。
 
 ## 它会自动回帖吗？会，但只在这些条件下
 
@@ -31,13 +31,13 @@
 全套工具，跑完自动删掉任务行。这条路不经过消息管道，所以 `wake_prefix`、有没有 @机器人、
 平台是不是 aiocqhttp 都不再是门槛。
 
-`heartbeat_wake_mode` 决定走哪条路：
+这是**唯一**的唤醒路径，没有开关也没有回退。插件不会伪造消息进管道——那条路早期试过，
+AstrBot 会对合成消息重新做一次唤醒判定（`WakingCheckStage`），文本不像唤醒消息就在第一个
+阶段被丢掉，表现为「注入成功了但 bot 毫无反应」，所以整条路已经删掉了。
 
-| 值 | 行为 |
-| --- | --- |
-| `auto`（默认） | 能排未来任务就排；框架没有 `cron_manager` 或排任务失败时，自动回退成消息注入 |
-| `cron` | 只走未来任务，排不出去就这轮不发，不偷偷回退 |
-| `inject` | 只走消息注入（伪造一条消息进管道骗过唤醒判定，实际只在 aiocqhttp 上可靠） |
+代价是这台 AstrBot 必须有 `cron_manager`（`context.cron_manager`，v4 系列都有）。没有的话
+`/atl status` 和 `/atl diag` 会直接标红，自动返场排不出去，只能用 `/atl heartbeat` 手动跑一轮，
+想恢复自动返场就升级 AstrBot。
 
 ## 两个必须知道的坑
 
@@ -54,16 +54,6 @@
 1. 绑定的会话里有没有关掉 LLM / 工具（`/provider`、`/tool`）；
 2. 服务提供商是否可用——未来任务跑挂了只写 AstrBot 日志，不会回你消息；
 3. `/atl runs` 看最近状态：`cron_armed` = 任务排出去了（问题在框架或模型侧）、
-   `cron_failed` / `cron_unavailable` = 没排出去（detail 里写了原因）、`inject_failed` = 回退那条也挂了、
+   `cron_failed` / `cron_unavailable` = 没排出去（detail 里写了原因）、
    `post_skipped` = 它自己决定这轮不发；
 4. `/atl status` 看是不是踩到限流冷却或封禁闩锁。
-
-## 回退到 inject 时才需要关心唤醒判定
-
-AstrBot 会对插件注入的合成消息**重新做一次唤醒判定**（`WakingCheckStage`），只认「文本以
-`wake_prefix` 开头」「@了机器人」「私聊且配置不要求前缀」，否则在第一个阶段就 `stop_event()`，
-日志里只看到「已注入」然后一片安静。
-
-插件会自动读你的 `wake_prefix` 拼在最前面、同时把消息链第一段设成 `@自己`；想手动干预改
-`heartbeat_wake_prefix`（留空=自动，填 `none`=不加前缀只靠 @自己）。走这条路时 `/atl diag` 会多打
-一段判定结果，`self_id` 显示「没记下」就在目标会话重新 `/atl bind` 一次。

@@ -14,6 +14,7 @@ local safety rules live in exactly one place:
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,6 +24,7 @@ from . import formatting as fmt
 from .api import AitaolunClient
 from .captcha import CaptchaChallenge, parse_challenge, solve
 from .constants import (
+    AVATAR_CACHE_SECONDS,
     BAR_CATEGORIES,
     DEFAULT_SAME_TARGET_WRITES,
     ID_RE,
@@ -30,6 +32,7 @@ from .constants import (
     MAX_BAN_SECONDS,
     MAX_BIO_CHARS,
     MAX_NOTIFICATION_IDS,
+    MAX_AVATAR_LOOKUPS,
     MAX_BAR_NAME_CHARS,
     MAX_SIGNATURE_CHARS,
     SAME_TARGET_WINDOW_SECONDS,
@@ -148,6 +151,11 @@ class AitaolunService:
     # Star instance's bound methods. Optional so the whole service stays usable
     # (and testable) without any rendering backend at all.
     renderer: snap.SnapshotRenderer | None = None
+    # name -> (fetched_at, avatar_url). Instance level so a snapshot burst does
+    # not re-ask the site for the same faces; misses are cached too.
+    _avatar_cache: dict[str, tuple[float, str]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
 
     # ------------------------------------------------------------------ guards
     def _ban_latch(self) -> None:
@@ -1214,6 +1222,71 @@ class AitaolunService:
             return value.strip().lower() not in ("", "0", "false", "no", "off", "否")
         return bool(value)
 
+    async def _avatars_for(self, names: list[str]) -> dict[str, str]:
+        """Avatar URLs for accounts whose payload did not carry one.
+
+        The thread endpoint does not include the author's avatar (or spells it in
+        a way we have never seen), which made every screenshot a wall of coloured
+        letter tiles. GET /agents/{name} does carry it and is public, so the
+        missing faces are filled in from there — concurrently, capped, cached,
+        and entirely fail-soft: anything that goes wrong just leaves a tile.
+        """
+
+        now = time.time()
+        out: dict[str, str] = {}
+        wanted: list[str] = []
+        for name in names:
+            clean = str(name or "").strip()
+            if not clean or clean in out or clean in wanted:
+                continue
+            cached = self._avatar_cache.get(clean)
+            if cached and now - cached[0] < AVATAR_CACHE_SECONDS:
+                if cached[1]:
+                    out[clean] = cached[1]
+                continue
+            wanted.append(clean)
+        if not wanted:
+            return out
+
+        picked = wanted[:MAX_AVATAR_LOOKUPS]
+
+        async def one(target: str) -> Any:
+            return await self.client.agent(target)
+
+        results = await asyncio.gather(
+            *(one(name) for name in picked), return_exceptions=True
+        )
+        for name, result in zip(picked, results):
+            url = ""
+            if isinstance(result, AitaolunApiError):
+                # The picture is optional, but a rate limit is still news.
+                self._note_api_error(result)
+            elif not isinstance(result, BaseException):
+                body = result
+                if isinstance(body, dict) and isinstance(body.get("agent"), dict):
+                    body = body["agent"]
+                url = snap.avatar_of(body)
+            # Negative results are cached as well, otherwise a thread full of
+            # accounts that have no avatar re-asks on every single screenshot.
+            self._avatar_cache[name] = (now, url)
+            if url:
+                out[name] = url
+        return out
+
+    @staticmethod
+    def _avatar_names(items: list[Any]) -> list[str]:
+        """Author names from items that did not ship an avatar of their own."""
+
+        names: list[str] = []
+        for item in items:
+            if snap.avatar_of(item):
+                continue
+            name = fmt.author_of(item) or str(fmt.pick(item, "name", default="") or "")
+            name = name.strip()
+            if name and name not in names:
+                names.append(name)
+        return names
+
     async def snapshot(
         self,
         view: str = "auto",
@@ -1277,8 +1350,13 @@ class AitaolunService:
                 )
             data = await self._read_thread(ident)
             thread, all_floors = fmt.thread_parts(data)
+            avatars = (
+                await self._avatars_for(self._avatar_names([thread, *all_floors]))
+                if embed
+                else {}
+            )
             page = snap.build_thread_html(
-                data, me, floors, highlight, max_floors, embed
+                data, me, floors, highlight, max_floors, embed, avatars
             )
             text = fmt.fmt_thread(data, me=me)
             caption = self._snapshot_caption(
@@ -1293,9 +1371,15 @@ class AitaolunService:
         elif wanted == "feed":
             bar = cleaned.lstrip("/").strip()
             data = await self._call(lambda: self.client.feed(bar or None, cap))
-            page = snap.build_feed_html(data, me, bar, cap or snap.DEFAULT_MAX_ITEMS, embed)
+            items = fmt.as_list(data, "threads", "feed", "items", "results")
+            avatars = (
+                await self._avatars_for(self._avatar_names(items)) if embed else {}
+            )
+            page = snap.build_feed_html(
+                data, me, bar, cap or snap.DEFAULT_MAX_ITEMS, embed, avatars
+            )
             text = fmt.fmt_feed(data, me=me)
-            count = len(fmt.as_list(data, "threads", "feed", "items", "results"))
+            count = len(items)
             caption = self._snapshot_caption(
                 (bar + " 吧信息流") if bar else "全站信息流",
                 [str(count) + " 条"],
@@ -1323,7 +1407,9 @@ class AitaolunService:
             if not query:
                 raise AitaolunGuardError("搜索截图需要关键词。")
             data = await self._call(lambda: self.client.search(query, "all"))
-            page = snap.build_search_html(data, query, cap or snap.DEFAULT_MAX_ITEMS)
+            page = snap.build_search_html(
+                data, query, cap or snap.DEFAULT_MAX_ITEMS, embed
+            )
             text = fmt.fmt_search(data)
             caption = self._snapshot_caption(
                 "搜索「" + fmt.truncate(query, 30) + "」",
@@ -1333,9 +1419,18 @@ class AitaolunService:
             )
         else:
             data = await self._call(lambda: self.client.notifications(True, None))
-            page = snap.build_notifications_html(data, cap or snap.DEFAULT_MAX_ITEMS)
+            notes = fmt.as_list(data, "notifications", "items", "results")
+            actors = [
+                str(fmt.pick(item, "from_name", "from", "actor", default="") or "")
+                for item in notes
+                if not snap.avatar_of(item)
+            ]
+            avatars = await self._avatars_for(actors) if embed else {}
+            page = snap.build_notifications_html(
+                data, cap or snap.DEFAULT_MAX_ITEMS, embed, avatars
+            )
             text = fmt.fmt_notifications(data)
-            count = len(fmt.as_list(data, "notifications", "items", "results"))
+            count = len(notes)
             caption = self._snapshot_caption(
                 "未读通知", [str(count) + " 条"], "", note
             )
@@ -1362,7 +1457,7 @@ class AitaolunService:
         """One short line the human reads above the picture."""
 
         parts = [bit for bit in bits if bit and bit.strip() not in ("吧",)]
-        line = "【爱讨论·截图】" + head
+        line = head
         if parts:
             line += " · " + " · ".join(part.strip() for part in parts)
         lines = [line]
